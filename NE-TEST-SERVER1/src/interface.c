@@ -229,6 +229,7 @@ int interface_init_local(struct xsk_interface *iface,
     memset(iface, 0, sizeof(*iface));
     iface->ifindex = if_nametoindex(local_cfg->ifname);
     strncpy(iface->ifname, local_cfg->ifname, IF_NAMESIZE - 1);
+    iface->ifname[IF_NAMESIZE - 1] = '\0';
     memcpy(iface->src_mac, local_cfg->src_mac, MAC_LEN);
     memcpy(iface->dst_mac, local_cfg->dst_mac, MAC_LEN);
 
@@ -288,7 +289,7 @@ int interface_init_local(struct xsk_interface *iface,
         int params_fd = bpf_map__fd(map);
         uint32_t k0 = 0, k1 = 1;
         uint32_t qcount = (uint32_t)queue_count;
-        uint32_t et     = (uint32_t)(local_cfg->flow_ethertype);
+        uint32_t et     = (uint32_t)(local_cfg->encap_ethertype);
         bpf_map_update_elem(params_fd, &k0, &qcount, 0);
         bpf_map_update_elem(params_fd, &k1, &et, 0);
     }
@@ -407,11 +408,12 @@ err_queues:
 int interface_init_wan(struct xsk_interface *iface,
                        const struct wan_config *wan_cfg) {
     int ret;
-    uint32_t idx;
+    uint32_t idx = 0;
 
     memset(iface, 0, sizeof(*iface));
     iface->ifindex = if_nametoindex(wan_cfg->ifname);
     strncpy(iface->ifname, wan_cfg->ifname, IF_NAMESIZE - 1);
+    iface->ifname[IF_NAMESIZE - 1] = '\0';
     memcpy(iface->src_mac, wan_cfg->src_mac, MAC_LEN);
     memcpy(iface->dst_mac, wan_cfg->dst_mac, MAC_LEN);
 
@@ -482,6 +484,7 @@ int interface_init_wan_rx(struct xsk_interface *iface,
     memset(iface, 0, sizeof(*iface));
     iface->ifindex = if_nametoindex(wan_cfg->ifname);
     strncpy(iface->ifname, wan_cfg->ifname, IF_NAMESIZE - 1);
+    iface->ifname[IF_NAMESIZE - 1] = '\0';
     memcpy(iface->src_mac, wan_cfg->src_mac, MAC_LEN);
     memcpy(iface->dst_mac, wan_cfg->dst_mac, MAC_LEN);
 
@@ -537,7 +540,7 @@ int interface_init_wan_rx(struct xsk_interface *iface,
         bpf_map_update_elem(cfg_fd, &key0, &fake4_net, 0);
         bpf_map_update_elem(cfg_fd, &key1, &fake6_net, 0);
         uint16_t qcount_u16 = (uint16_t)queue_count;
-        uint16_t et_u16     = wan_cfg->flow_ethertype;
+        uint16_t et_u16     = wan_cfg->encap_ethertype;
         bpf_map_update_elem(cfg_fd, &key2, &qcount_u16, 0);
         bpf_map_update_elem(cfg_fd, &key3, &et_u16, 0);
     }

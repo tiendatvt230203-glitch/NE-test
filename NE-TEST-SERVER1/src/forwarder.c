@@ -60,7 +60,7 @@ static int set_wan_l2_addrs(struct forwarder *fwd, int wan_idx, uint8_t *pkt) {
 }
 
 /* WAN encapsulation:
- *   outer: dst/src MAC for WAN, EtherType=flow_ethertype
+ *   outer: dst/src MAC for WAN, EtherType=encap_ethertype
  *   payload: flow_id (8 bytes, big endian) + inner Ethernet frame (original)
  *
  * This keeps only L2 cleartext on the WAN link. On WAN RX we decap before
@@ -91,7 +91,7 @@ static int wan_encap_inplace(struct forwarder *fwd, int wan_idx, uint8_t *pkt, u
         return -1;
     if (wan_idx < 0 || wan_idx >= fwd->wan_count)
         return -1;
-    if (!fwd->cfg || fwd->cfg->flow_ethertype == 0)
+    if (!fwd->cfg || fwd->cfg->encap_ethertype == 0)
         return -1;
 
     struct xsk_interface *wan = &fwd->wans[wan_idx];
@@ -115,7 +115,7 @@ static int wan_encap_inplace(struct forwarder *fwd, int wan_idx, uint8_t *pkt, u
     struct ether_header *eth = (struct ether_header *)pkt;
     memcpy(eth->ether_dhost, wan->dst_mac, MAC_LEN);
     memcpy(eth->ether_shost, wan->src_mac, MAC_LEN);
-    eth->ether_type = htons(fwd->cfg->flow_ethertype);
+    eth->ether_type = htons(fwd->cfg->encap_ethertype);
 
     /* flow_id (u32) in big-endian */
     uint32_t fid32 = (uint32_t)(fid & 0xffffffffu);
@@ -129,7 +129,7 @@ static int wan_encap_inplace(struct forwarder *fwd, int wan_idx, uint8_t *pkt, u
 static int wan_decap_inplace(struct forwarder *fwd, uint8_t *pkt, uint32_t *pkt_len_io) {
     if (!fwd || !pkt || !pkt_len_io || !fwd->cfg)
         return -1;
-    if (fwd->cfg->flow_ethertype == 0)
+    if (fwd->cfg->encap_ethertype == 0)
         return 1; /* nothing to do */
 
     uint32_t pkt_len = *pkt_len_io;
@@ -137,7 +137,7 @@ static int wan_decap_inplace(struct forwarder *fwd, uint8_t *pkt, uint32_t *pkt_
         return 1;
 
     struct ether_header *eth = (struct ether_header *)pkt;
-    if (ntohs(eth->ether_type) != fwd->cfg->flow_ethertype)
+    if (ntohs(eth->ether_type) != fwd->cfg->encap_ethertype)
         return 1;
 
     /* Strip outer eth + flow_id, shift inner frame back. */
@@ -318,7 +318,7 @@ static void *local_queue_thread_no_crypto(void *arg) {
             uint8_t                *pkt = (uint8_t *)pkt_ptrs[i];
             uint32_t                out_len = pkt_lens[i];
 
-            if (fwd->cfg && fwd->cfg->flow_ethertype != 0) {
+            if (fwd->cfg && fwd->cfg->encap_ethertype != 0) {
                 if (wan_encap_inplace(fwd, wan_idx, pkt, &out_len) != 0) {
                     __sync_fetch_and_add(&fwd->total_dropped, 1);
                     continue;

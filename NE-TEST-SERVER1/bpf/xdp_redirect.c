@@ -129,9 +129,9 @@ int xdp_redirect_prog(struct xdp_md *ctx)
         return XDP_PASS;
     }
 
-    /* Optional: steer encrypted frames by flow_id in a custom EtherType.
+    /* Optional: steer encapsulated WAN frames by flow_id (custom EtherType).
      * xsk_params_map[0] = qcount
-     * xsk_params_map[1] = flow_ethertype (host order)
+     * xsk_params_map[1] = encap_ethertype (host order)
      */
     __u32 k0 = 0, k1 = 1;
     __u32 *qcountp = bpf_map_lookup_elem(&xsk_params_map, &k0);

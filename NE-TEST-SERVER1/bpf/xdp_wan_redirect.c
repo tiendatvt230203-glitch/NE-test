@@ -114,9 +114,9 @@ int xdp_wan_redirect_prog(struct xdp_md *ctx)
 redirect:
     ;
 
-    /* Optional flow_id steering:
+    /* Optional flow_id steering on encapsulated frames:
      * wan_config_map[2] = qcount (u16)
-     * wan_config_map[3] = flow_ethertype (u16, host order)
+     * wan_config_map[3] = encap_ethertype (u16, host order)
      */
     __u32 k2 = 2, k3 = 3;
     __u16 *qcountp = bpf_map_lookup_elem(&wan_config_map, &k2);

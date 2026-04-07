@@ -42,7 +42,7 @@ struct local_config {
     uint32_t frame_size;
     int      queue_count;
     int      irq_cpu; /* -1: don't touch */
-    uint16_t flow_ethertype; /* inherited from app_config.flow_ethertype if set */
+    uint16_t encap_ethertype; /* inherited from app_config.encap_ethertype if set */
 };
 
 struct wan_config {
@@ -56,7 +56,7 @@ struct wan_config {
     uint32_t frame_size;
     int      queue_count;
     int      irq_cpu; /* -1: don't touch */
-    uint16_t flow_ethertype; /* inherited from app_config.flow_ethertype if set */
+    uint16_t encap_ethertype; /* inherited from app_config.encap_ethertype if set */
 };
 
 struct cpu_policy_config {
@@ -71,7 +71,7 @@ struct app_config {
     int      cpu_local_base; /* legacy: base + queue_idx (per-iface) */
     int      cpu_wan_base;   /* legacy: base + queue_idx (per-iface) */
     int      cpu_lane_base;  /* global lane pinning: base + lane_id */
-    uint16_t flow_ethertype; /* if !=0, XDP can steer by flow_id header */
+    uint16_t encap_ethertype; /* if !=0, WAN frames are encapsulated with this EtherType for flow_id steering */
 
     struct local_config locals[MAX_INTERFACES];
     int                 local_count;

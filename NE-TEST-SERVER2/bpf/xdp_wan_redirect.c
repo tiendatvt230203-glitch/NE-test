@@ -1,0 +1,146 @@
+#include <linux/bpf.h>
+#include <linux/if_ether.h>
+#include <linux/ip.h>
+#include <linux/in.h>
+#include <linux/ipv6.h>
+#include <bpf/bpf_helpers.h>
+#include <bpf/bpf_endian.h>
+
+struct {
+    __uint(type, BPF_MAP_TYPE_XSKMAP);
+    __uint(max_entries, 64);
+    __type(key, __u32);
+    __type(value, __u32);
+} wan_xsks_map SEC(".maps");
+
+struct {
+    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __uint(max_entries, 8);
+    __type(key, __u32);
+    __type(value, __u64);
+} wan_stats_map SEC(".maps");
+
+struct {
+    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __uint(max_entries, 4);
+    __type(key, __u32);
+    __type(value, __u16);
+} wan_config_map SEC(".maps");
+
+#define STAT_TOTAL      0
+#define STAT_NON_IP     1
+#define STAT_REDIRECT   2
+#define STAT_NO_SOCK    3
+#define STAT_ARP_PASS   4
+#define STAT_ICMP_PASS  5
+#define IPPROTO_ICMP_VAL 1
+
+static __always_inline __u32 bswap32(__u32 x)
+{
+    return bpf_htonl(x);
+}
+
+static __always_inline void inc_stat(__u32 idx)
+{
+    __u64 *val = bpf_map_lookup_elem(&wan_stats_map, &idx);
+    if (val)
+        __sync_fetch_and_add(val, 1);
+}
+
+SEC("xdp")
+int xdp_wan_redirect_prog(struct xdp_md *ctx)
+{
+    void *data = (void *)(long)ctx->data;
+    void *data_end = (void *)(long)ctx->data_end;
+
+    inc_stat(STAT_TOTAL);
+
+    struct ethhdr *eth = data;
+    if ((void *)(eth + 1) > data_end)
+        return XDP_PASS;
+
+    __u16 proto = eth->h_proto;
+    void *nh    = (void *)(eth + 1);
+
+    if (proto == __constant_htons(ETH_P_8021Q)) {
+        if ((__u8 *)nh + 4 > (__u8 *)data_end)
+            return XDP_PASS;
+        __be16 *ipe = (__be16 *)((__u8 *)nh + 2);
+        proto       = *ipe;
+        nh          = (void *)((__u8 *)nh + 4);
+    }
+
+    if (proto == __constant_htons(ETH_P_ARP)) {
+        inc_stat(STAT_ARP_PASS);
+        return XDP_PASS;
+    }
+
+    if (proto == __constant_htons(ETH_P_IP)) {
+        struct iphdr *ip = nh;
+        if ((void *)(ip + 1) > data_end)
+            return XDP_PASS;
+        if (ip->protocol == IPPROTO_ICMP_VAL) {
+            inc_stat(STAT_ICMP_PASS);
+            return XDP_PASS;
+        }
+        goto redirect;
+    }
+
+    if (proto == __constant_htons(ETH_P_IPV6)) {
+        struct ipv6hdr *ip6 = nh;
+        if ((void *)(ip6 + 1) > data_end)
+            return XDP_PASS;
+        if (ip6->nexthdr == IPPROTO_ICMPV6) {
+            inc_stat(STAT_ICMP_PASS);
+            return XDP_PASS;
+        }
+        goto redirect;
+    }
+
+    __u32 key0 = 0, key1 = 1;
+    __u16 *fake4 = bpf_map_lookup_elem(&wan_config_map, &key0);
+    if (fake4 && *fake4 != 0 &&
+        (proto & __constant_htons(0xFF00)) == (*fake4 & __constant_htons(0xFF00)))
+        goto redirect;
+
+    __u16 *fake6 = bpf_map_lookup_elem(&wan_config_map, &key1);
+    if (fake6 && *fake6 != 0 &&
+        (proto & __constant_htons(0xFF00)) == (*fake6 & __constant_htons(0xFF00)))
+        goto redirect;
+
+    inc_stat(STAT_NON_IP);
+    return XDP_PASS;
+
+redirect:
+    ;
+
+    /* Optional flow_id steering on encapsulated frames:
+     * wan_config_map[2] = qcount (u16)
+     * wan_config_map[3] = encap_ethertype (u16, host order)
+     */
+    __u32 k2 = 2, k3 = 3;
+    __u16 *qcountp = bpf_map_lookup_elem(&wan_config_map, &k2);
+    __u16 *etp     = bpf_map_lookup_elem(&wan_config_map, &k3);
+    __u32 queue_id = ctx->rx_queue_index;
+    if (etp && *etp != 0 && proto == __constant_htons(*etp)) {
+        if ((__u8 *)nh + 4 <= (__u8 *)data_end) {
+            __u32 fid_net;
+            __builtin_memcpy(&fid_net, nh, sizeof(fid_net));
+            __u32 fid = bswap32(fid_net);
+            __u16 qcount = qcountp ? *qcountp : 0;
+            if (qcount)
+                queue_id = (__u32)(fid % qcount);
+        }
+    }
+    int ret = bpf_redirect_map(&wan_xsks_map, queue_id, XDP_PASS);
+
+    if (ret == XDP_REDIRECT) {
+        inc_stat(STAT_REDIRECT);
+    } else {
+        inc_stat(STAT_NO_SOCK);
+    }
+
+    return ret;
+}
+
+char _license[] SEC("license") = "GPL";
