@@ -1,7 +1,8 @@
 #include <linux/bpf.h>
 #include <linux/if_ether.h>
 #include <linux/ip.h>
-#include <linux/icmp.h>
+#include <linux/in.h>
+#include <linux/ipv6.h>
 #include <bpf/bpf_helpers.h>
 #include <bpf/bpf_endian.h>
 
@@ -54,7 +55,15 @@ int xdp_wan_redirect_prog(struct xdp_md *ctx)
         return XDP_PASS;
 
     __u16 proto = eth->h_proto;
+    void *nh    = (void *)(eth + 1);
 
+    if (proto == __constant_htons(ETH_P_8021Q)) {
+        if ((__u8 *)nh + 4 > (__u8 *)data_end)
+            return XDP_PASS;
+        __be16 *ipe = (__be16 *)((__u8 *)nh + 2);
+        proto       = *ipe;
+        nh          = (void *)((__u8 *)nh + 4);
+    }
 
     if (proto == __constant_htons(ETH_P_ARP)) {
         inc_stat(STAT_ARP_PASS);
@@ -62,10 +71,9 @@ int xdp_wan_redirect_prog(struct xdp_md *ctx)
     }
 
     if (proto == __constant_htons(ETH_P_IP)) {
-        struct iphdr *ip = (void *)(eth + 1);
+        struct iphdr *ip = nh;
         if ((void *)(ip + 1) > data_end)
             return XDP_PASS;
-
         if (ip->protocol == IPPROTO_ICMP_VAL) {
             inc_stat(STAT_ICMP_PASS);
             return XDP_PASS;
@@ -73,9 +81,16 @@ int xdp_wan_redirect_prog(struct xdp_md *ctx)
         goto redirect;
     }
 
-    if (proto == __constant_htons(ETH_P_IPV6))
+    if (proto == __constant_htons(ETH_P_IPV6)) {
+        struct ipv6hdr *ip6 = nh;
+        if ((void *)(ip6 + 1) > data_end)
+            return XDP_PASS;
+        if (ip6->nexthdr == IPPROTO_ICMPV6) {
+            inc_stat(STAT_ICMP_PASS);
+            return XDP_PASS;
+        }
         goto redirect;
-
+    }
 
     int key0 = 0, key1 = 1;
     __u16 *fake4 = bpf_map_lookup_elem(&wan_config_map, &key0);

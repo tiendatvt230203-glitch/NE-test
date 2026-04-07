@@ -1,14 +1,16 @@
 #include <linux/bpf.h>
 #include <linux/if_ether.h>
 #include <linux/ip.h>
+#include <linux/in.h>
+#include <linux/ipv6.h>
 #include <bpf/bpf_helpers.h>
 #include <bpf/bpf_endian.h>
 
 
 #define MAX_SRC_NETS 32
 #define MAX_DST_NETS 32
-#define IPPROTO_ICMP_VAL 1
-#define ETH_P_ARP_VAL 0x0806
+#define IPPROTO_ICMP_VAL   1
+#define ETH_P_ARP_VAL      0x0806
 
 struct redirect_cfg {
     __u32 src_net[MAX_SRC_NETS];
@@ -48,18 +50,13 @@ static __always_inline void inc_stat(__u32 idx)
         __sync_fetch_and_add(val, 1);
 }
 
-static __always_inline int parse_ipv4(void *data, void *data_end,
-                                      __u32 *src_ip, __u32 *dst_ip, __u8 *proto)
+static __always_inline int parse_ipv4_at(void *nh, void *data_end, __u32 *src_ip,
+                                        __u32 *dst_ip, __u8 *proto)
 {
-    struct ethhdr *eth = data;
-    if ((void *)(eth + 1) > data_end)
-        return -1;
-
-    if (eth->h_proto != bpf_htons(ETH_P_IP))
-        return -1;
-
-    struct iphdr *ip = (void *)(eth + 1);
+    struct iphdr *ip = nh;
     if ((void *)(ip + 1) > data_end)
+        return -1;
+    if (ip->ihl < 5)
         return -1;
 
     *src_ip = ip->saddr;
@@ -88,24 +85,54 @@ int xdp_redirect_prog(struct xdp_md *ctx)
         return XDP_PASS;
     }
 
-    if (eth->h_proto == bpf_htons(ETH_P_ARP_VAL)) {
+    __u16 proto = eth->h_proto;
+    void *nh    = (void *)(eth + 1);
+
+    if (proto == bpf_htons(ETH_P_8021Q)) {
+        if ((__u8 *)nh + 4 > (__u8 *)data_end) {
+            inc_stat(1);
+            return XDP_PASS;
+        }
+        __be16 *ipe = (__be16 *)((__u8 *)nh + 2);
+        proto       = *ipe;
+        nh          = (void *)((__u8 *)nh + 4);
+    }
+
+    if (proto == bpf_htons(ETH_P_ARP_VAL)) {
         inc_stat(7);
+        return XDP_PASS;
+    }
+
+    if (proto == bpf_htons(ETH_P_IPV6)) {
+        struct ipv6hdr *ip6 = nh;
+        if ((void *)(ip6 + 1) > data_end) {
+            inc_stat(1);
+            return XDP_PASS;
+        }
+        if (ip6->nexthdr == IPPROTO_ICMPV6) {
+            inc_stat(4);
+            return XDP_PASS;
+        }
+        inc_stat(1);
+        return XDP_PASS;
+    }
+
+    if (proto != bpf_htons(ETH_P_IP)) {
+        inc_stat(1);
         return XDP_PASS;
     }
 
     __u32 src_ip, dst_ip;
     __u8 l4_proto = 0;
-    if (parse_ipv4(data, data_end, &src_ip, &dst_ip, &l4_proto) < 0) {
+    if (parse_ipv4_at(nh, data_end, &src_ip, &dst_ip, &l4_proto) < 0) {
         inc_stat(1);
         return XDP_PASS;
     }
-
 
     if (l4_proto == IPPROTO_ICMP_VAL) {
         inc_stat(4);
         return XDP_PASS;
     }
-
 
     __u32 cfg_key = 0;
     struct redirect_cfg *cfg = bpf_map_lookup_elem(&config_map, &cfg_key);
@@ -137,7 +164,6 @@ int xdp_redirect_prog(struct xdp_md *ctx)
         inc_stat(3);
         return XDP_PASS;
     }
-
 
     __u32 qid = 0;
     int *sock = bpf_map_lookup_elem(&xsks_map, &qid);
