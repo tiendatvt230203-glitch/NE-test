@@ -9,6 +9,8 @@
 #include <sched.h>
 
 static int ne_plain_libbpf_print(enum libbpf_print_level level, const char *fmt, va_list ap) {
+    if (level == LIBBPF_DEBUG)
+        return 0;
     va_list aq;
     va_copy(aq, ap);
     char buf[768];

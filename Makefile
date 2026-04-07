@@ -5,10 +5,10 @@ LDFLAGS   = -lbpf -lxdp -pthread
 
 # Môi trường header libbpf 1.x nhưng .so cũ (thiếu bpf_xdp_attach): make CFLAGS+=' -DNE_PLAIN_BPF_XDP_LEGACY'
 
-# Default: no -g so the .o has no .BTF — avoids noisy "bpf_create_map_xattr ... Retrying without BTF"
-# on kernels/libbpf where map+BTF create fails first then succeeds without BTF.
-# For BTF/line info: make EXTRA_BPF_CFLAGS=-g
-BPF_CFLAGS     = -O2 -target bpf $(EXTRA_BPF_CFLAGS)
+# -g → .BTF. Libbpf 1.x thường *bắt buộc* BTF cho map kiểu BTF; không -g sẽ lỗi
+# "BTF is required, but is missing or corrupted." Log "Retrying without BTF" khi tạo map
+# được lọc trong main.c (libbpf_set_print). Thêm cờ: make EXTRA_BPF_CFLAGS=...
+BPF_CFLAGS     = -O2 -target bpf -g $(EXTRA_BPF_CFLAGS)
 KERNEL_HEADERS = /usr/include
 
 BIN_DIR = bin
