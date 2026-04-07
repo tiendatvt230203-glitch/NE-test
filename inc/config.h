@@ -41,6 +41,8 @@ struct local_config {
     uint32_t batch_size;
     uint32_t frame_size;
     int      queue_count;
+    int      irq_cpu; /* -1: don't touch */
+    uint16_t flow_ethertype; /* inherited from app_config.flow_ethertype if set */
 };
 
 struct wan_config {
@@ -53,11 +55,23 @@ struct wan_config {
     uint32_t batch_size;
     uint32_t frame_size;
     int      queue_count;
+    int      irq_cpu; /* -1: don't touch */
+    uint16_t flow_ethertype; /* inherited from app_config.flow_ethertype if set */
+};
+
+struct cpu_policy_config {
+    int enabled;
+    int default_irq_cpu; /* -1: don't touch */
+    char backup_dir[256];
 };
 
 struct app_config {
     uint32_t global_frame_size;
     uint32_t global_batch_size;
+    int      cpu_local_base; /* legacy: base + queue_idx (per-iface) */
+    int      cpu_wan_base;   /* legacy: base + queue_idx (per-iface) */
+    int      cpu_lane_base;  /* global lane pinning: base + lane_id */
+    uint16_t flow_ethertype; /* if !=0, XDP can steer by flow_id header */
 
     struct local_config locals[MAX_INTERFACES];
     int                 local_count;
@@ -69,6 +83,8 @@ struct app_config {
     char bpf_wan_o[512];
 
     struct redirect_cfg redirect;
+
+    struct cpu_policy_config cpu_policy;
 };
 
 int  parse_mac(const char *str, uint8_t *mac);

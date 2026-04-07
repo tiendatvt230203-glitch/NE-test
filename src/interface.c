@@ -283,6 +283,16 @@ int interface_init_local(struct xsk_interface *iface,
     if (map)
         register_config_map_fd(bpf_map__fd(map));
 
+    map = bpf_object__find_map_by_name(bpf_obj, "xsk_params_map");
+    if (map) {
+        int params_fd = bpf_map__fd(map);
+        uint32_t k0 = 0, k1 = 1;
+        uint32_t qcount = (uint32_t)queue_count;
+        uint32_t et     = (uint32_t)(local_cfg->flow_ethertype);
+        bpf_map_update_elem(params_fd, &k0, &qcount, 0);
+        bpf_map_update_elem(params_fd, &k1, &et, 0);
+    }
+
     size_t local_umem_size = (size_t)local_cfg->umem_mb * 1024 * 1024;
     iface->umem_size = local_umem_size;
     iface->ring_size = local_cfg->ring_size;
@@ -521,11 +531,15 @@ int interface_init_wan_rx(struct xsk_interface *iface,
     map = bpf_object__find_map_by_name(wan_bpf_obj, "wan_config_map");
     if (map) {
         int cfg_fd = bpf_map__fd(map);
-        uint32_t key0 = 0, key1 = 1;
+        uint32_t key0 = 0, key1 = 1, key2 = 2, key3 = 3;
         uint16_t fake4_net = htons(fake_ethertype_ipv4);
         uint16_t fake6_net = htons(fake_ethertype_ipv6);
         bpf_map_update_elem(cfg_fd, &key0, &fake4_net, 0);
         bpf_map_update_elem(cfg_fd, &key1, &fake6_net, 0);
+        uint16_t qcount_u16 = (uint16_t)queue_count;
+        uint16_t et_u16     = wan_cfg->flow_ethertype;
+        bpf_map_update_elem(cfg_fd, &key2, &qcount_u16, 0);
+        bpf_map_update_elem(cfg_fd, &key3, &et_u16, 0);
     }
 
     size_t wan_umem_size = (size_t)wan_cfg->umem_mb * 1024 * 1024;

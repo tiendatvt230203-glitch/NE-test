@@ -8,7 +8,7 @@
 
 struct {
     __uint(type, BPF_MAP_TYPE_XSKMAP);
-    __uint(max_entries, 8);
+    __uint(max_entries, 64);
     __type(key, __u32);
     __type(value, __u32);
 } wan_xsks_map SEC(".maps");
@@ -22,7 +22,7 @@ struct {
 
 struct {
     __uint(type, BPF_MAP_TYPE_ARRAY);
-    __uint(max_entries, 2);
+    __uint(max_entries, 4);
     __type(key, __u32);
     __type(value, __u16);
 } wan_config_map SEC(".maps");
@@ -34,6 +34,11 @@ struct {
 #define STAT_ARP_PASS   4
 #define STAT_ICMP_PASS  5
 #define IPPROTO_ICMP_VAL 1
+
+static __always_inline __u32 bswap32(__u32 x)
+{
+    return bpf_htonl(x);
+}
 
 static __always_inline void inc_stat(__u32 idx)
 {
@@ -109,7 +114,24 @@ int xdp_wan_redirect_prog(struct xdp_md *ctx)
 redirect:
     ;
 
-    __u32 queue_id = 0;
+    /* Optional flow_id steering:
+     * wan_config_map[2] = qcount (u16)
+     * wan_config_map[3] = flow_ethertype (u16, host order)
+     */
+    __u32 k2 = 2, k3 = 3;
+    __u16 *qcountp = bpf_map_lookup_elem(&wan_config_map, &k2);
+    __u16 *etp     = bpf_map_lookup_elem(&wan_config_map, &k3);
+    __u32 queue_id = ctx->rx_queue_index;
+    if (etp && *etp != 0 && proto == __constant_htons(*etp)) {
+        if ((__u8 *)nh + 4 <= (__u8 *)data_end) {
+            __u32 fid_net;
+            __builtin_memcpy(&fid_net, nh, sizeof(fid_net));
+            __u32 fid = bswap32(fid_net);
+            __u16 qcount = qcountp ? *qcountp : 0;
+            if (qcount)
+                queue_id = (__u32)(fid % qcount);
+        }
+    }
     int ret = bpf_redirect_map(&wan_xsks_map, queue_id, XDP_PASS);
 
     if (ret == XDP_REDIRECT) {

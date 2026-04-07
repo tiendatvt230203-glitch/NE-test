@@ -53,8 +53,19 @@ int config_load_file(const char *path, struct app_config *cfg) {
     memset(cfg, 0, sizeof(*cfg));
     cfg->global_frame_size = DEFAULT_FRAME_SIZE;
     cfg->global_batch_size = DEFAULT_BATCH_SIZE;
+    cfg->cpu_local_base = NE_PLAIN_CPU;
+    cfg->cpu_wan_base   = NE_PLAIN_CPU;
+    cfg->cpu_lane_base  = -1;
+    cfg->flow_ethertype = 0;
     snprintf(cfg->bpf_local_o, sizeof(cfg->bpf_local_o), "bpf/xdp_redirect.o");
     snprintf(cfg->bpf_wan_o, sizeof(cfg->bpf_wan_o), "bpf/xdp_wan_redirect.o");
+    cfg->cpu_policy.enabled = 0;
+    cfg->cpu_policy.default_irq_cpu = -1;
+    snprintf(cfg->cpu_policy.backup_dir, sizeof(cfg->cpu_policy.backup_dir), "/root/irq-affinity-backup");
+    for (int i = 0; i < MAX_INTERFACES; i++) {
+        cfg->locals[i].irq_cpu = -2; /* unset sentinel */
+        cfg->wans[i].irq_cpu   = -2; /* unset sentinel */
+    }
 
     int max_local = -1, max_wan = -1;
     char line[512];
@@ -81,6 +92,20 @@ int config_load_file(const char *path, struct app_config *cfg) {
             snprintf(cfg->bpf_local_o, sizeof(cfg->bpf_local_o), "%s", val);
         else if (strcmp(key, "bpf_wan") == 0)
             snprintf(cfg->bpf_wan_o, sizeof(cfg->bpf_wan_o), "%s", val);
+        else if (strcmp(key, "cpu_local_base") == 0)
+            cfg->cpu_local_base = (int)strtol(val, NULL, 10);
+        else if (strcmp(key, "cpu_wan_base") == 0)
+            cfg->cpu_wan_base = (int)strtol(val, NULL, 10);
+        else if (strcmp(key, "cpu_lane_base") == 0)
+            cfg->cpu_lane_base = (int)strtol(val, NULL, 10);
+        else if (strcmp(key, "flow_ethertype") == 0)
+            cfg->flow_ethertype = (uint16_t)strtoul(val, NULL, 0);
+        else if (strcmp(key, "cpu_policy_enable") == 0)
+            cfg->cpu_policy.enabled = (int)strtol(val, NULL, 10) != 0;
+        else if (strcmp(key, "cpu_policy_default_irq_cpu") == 0)
+            cfg->cpu_policy.default_irq_cpu = (int)strtol(val, NULL, 10);
+        else if (strcmp(key, "cpu_policy_backup_dir") == 0)
+            snprintf(cfg->cpu_policy.backup_dir, sizeof(cfg->cpu_policy.backup_dir), "%s", val);
         else {
             int idx;
             char suffix[64];
@@ -105,6 +130,10 @@ int config_load_file(const char *path, struct app_config *cfg) {
                     L->ring_size = (uint32_t)strtoul(val, NULL, 10);
                 else if (strcmp(suffix, "batch_size") == 0)
                     L->batch_size = (uint32_t)strtoul(val, NULL, 10);
+                else if (strcmp(suffix, "queue_count") == 0)
+                    L->queue_count = (int)strtol(val, NULL, 10);
+                else if (strcmp(suffix, "irq_cpu") == 0)
+                    L->irq_cpu = (int)strtol(val, NULL, 10);
             } else if (sscanf(key, "wan%d_%63s", &idx, suffix) == 2) {
                 if (idx < 0 || idx >= MAX_INTERFACES)
                     continue;
@@ -125,6 +154,10 @@ int config_load_file(const char *path, struct app_config *cfg) {
                     W->ring_size = (uint32_t)strtoul(val, NULL, 10);
                 else if (strcmp(suffix, "batch_size") == 0)
                     W->batch_size = (uint32_t)strtoul(val, NULL, 10);
+                else if (strcmp(suffix, "queue_count") == 0)
+                    W->queue_count = (int)strtol(val, NULL, 10);
+                else if (strcmp(suffix, "irq_cpu") == 0)
+                    W->irq_cpu = (int)strtol(val, NULL, 10);
             }
         }
     }
@@ -143,7 +176,11 @@ int config_load_file(const char *path, struct app_config *cfg) {
             L->umem_mb = DEFAULT_UMEM_MB_LOCAL;
         if (L->ring_size == 0)
             L->ring_size = DEFAULT_RING_SIZE;
-        L->queue_count = DEFAULT_QUEUE_COUNT;
+        if (L->queue_count <= 0)
+            L->queue_count = DEFAULT_QUEUE_COUNT;
+        L->flow_ethertype = cfg->flow_ethertype;
+        if (L->irq_cpu == -2)
+            L->irq_cpu = cfg->cpu_policy.enabled ? cfg->cpu_policy.default_irq_cpu : -1;
     }
     for (int i = 0; i < cfg->wan_count; i++) {
         struct wan_config *W = &cfg->wans[i];
@@ -157,7 +194,11 @@ int config_load_file(const char *path, struct app_config *cfg) {
             W->ring_size = DEFAULT_RING_SIZE;
         if (W->window_size == 0)
             W->window_size = 2048u * 1024u;
-        W->queue_count = DEFAULT_QUEUE_COUNT;
+        if (W->queue_count <= 0)
+            W->queue_count = DEFAULT_QUEUE_COUNT;
+        W->flow_ethertype = cfg->flow_ethertype;
+        if (W->irq_cpu == -2)
+            W->irq_cpu = cfg->cpu_policy.enabled ? cfg->cpu_policy.default_irq_cpu : -1;
     }
 
     return 0;

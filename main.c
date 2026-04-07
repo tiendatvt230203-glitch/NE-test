@@ -1,5 +1,6 @@
 #include "forwarder.h"
 #include "config.h"
+#include "cpu_policy.h"
 #include <bpf/libbpf.h>
 #include <stdarg.h>
 #include <stdio.h>
@@ -42,11 +43,21 @@ int main(int argc, char **argv) {
     if (config_validate(&cfg) != 0)
         return EXIT_FAILURE;
 
+    struct cpu_policy_state cpu_st;
+    if (cpu_policy_apply(&cfg, &cpu_st) != 0) {
+        fprintf(stderr, "[cpu-policy] apply failed\n");
+        return EXIT_FAILURE;
+    }
+
     struct forwarder fwd;
     if (forwarder_init(&fwd, &cfg) != 0)
+    {
+        (void)cpu_policy_restore(&cpu_st);
         return EXIT_FAILURE;
+    }
 
     forwarder_run(&fwd);
     forwarder_cleanup(&fwd);
+    (void)cpu_policy_restore(&cpu_st);
     return EXIT_SUCCESS;
 }

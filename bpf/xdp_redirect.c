@@ -43,6 +43,18 @@ struct {
     __type(value, __u32);
 } xsks_map SEC(".maps");
 
+struct {
+    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __uint(max_entries, 2);
+    __type(key, __u32);
+    __type(value, __u32);
+} xsk_params_map SEC(".maps");
+
+static __always_inline __u32 bswap32(__u32 x)
+{
+    return bpf_htonl(x);
+}
+
 static __always_inline void inc_stat(__u32 idx)
 {
     __u64 *val = bpf_map_lookup_elem(&stats_map, &idx);
@@ -117,6 +129,30 @@ int xdp_redirect_prog(struct xdp_md *ctx)
         return XDP_PASS;
     }
 
+    /* Optional: steer encrypted frames by flow_id in a custom EtherType.
+     * xsk_params_map[0] = qcount
+     * xsk_params_map[1] = flow_ethertype (host order)
+     */
+    __u32 k0 = 0, k1 = 1;
+    __u32 *qcountp = bpf_map_lookup_elem(&xsk_params_map, &k0);
+    __u32 *etp     = bpf_map_lookup_elem(&xsk_params_map, &k1);
+    if (etp && *etp != 0 && proto == bpf_htons((__u16)*etp)) {
+        if ((__u8 *)nh + 4 <= (__u8 *)data_end) {
+            __u32 fid_net;
+            __builtin_memcpy(&fid_net, nh, sizeof(fid_net));
+            __u32 fid = bswap32(fid_net);
+            __u32 qcount = qcountp ? *qcountp : 0;
+            __u32 qid = qcount ? (__u32)(fid % qcount) : ctx->rx_queue_index;
+            int *sock = bpf_map_lookup_elem(&xsks_map, &qid);
+            if (sock) {
+                inc_stat(6);
+                return bpf_redirect_map(&xsks_map, qid, 0);
+            }
+        }
+        inc_stat(5);
+        return XDP_PASS;
+    }
+
     if (proto != bpf_htons(ETH_P_IP)) {
         inc_stat(1);
         return XDP_PASS;
@@ -165,7 +201,7 @@ int xdp_redirect_prog(struct xdp_md *ctx)
         return XDP_PASS;
     }
 
-    __u32 qid = 0;
+    __u32 qid = ctx->rx_queue_index;
     int *sock = bpf_map_lookup_elem(&xsks_map, &qid);
     if (!sock) {
         inc_stat(5);

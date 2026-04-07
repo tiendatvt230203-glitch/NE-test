@@ -16,18 +16,25 @@
 static volatile int running            = 1;
 static struct flow_table g_flow_table;
 
+static int parse_flow(void *pkt_data, uint32_t pkt_len, uint32_t *src_ip, uint32_t *dst_ip,
+                      uint16_t *src_port, uint16_t *dst_port, uint8_t *protocol);
+
 struct queue_thread_args {
     struct forwarder *fwd;
     int               iface_idx;
     int               queue_idx;
     int               tx_queue_base;
     int               wan_worker_index;
+    int               cpu_id;
+    int               lane_id;
 };
 
-static void pin_data_plane_cpu(void) {
+static void pin_data_plane_cpu(int cpu_id) {
     cpu_set_t cpuset;
     CPU_ZERO(&cpuset);
-    CPU_SET(NE_PLAIN_CPU, &cpuset);
+    if (cpu_id < 0)
+        cpu_id = NE_PLAIN_CPU;
+    CPU_SET(cpu_id, &cpuset);
     (void)pthread_setaffinity_np(pthread_self(), sizeof(cpuset), &cpuset);
 }
 
@@ -50,6 +57,93 @@ static int set_wan_l2_addrs(struct forwarder *fwd, int wan_idx, uint8_t *pkt) {
         return -1;
     struct xsk_interface *w = &fwd->wans[wan_idx];
     return l2_rewrite_ether(pkt, w->dst_mac, w->src_mac);
+}
+
+/* WAN encapsulation:
+ *   outer: dst/src MAC for WAN, EtherType=flow_ethertype
+ *   payload: flow_id (8 bytes, big endian) + inner Ethernet frame (original)
+ *
+ * This keeps only L2 cleartext on the WAN link. On WAN RX we decap before
+ * forwarding down to local so local/client never sees the custom EtherType.
+ */
+#define NE_WAN_ENCAP_FID_LEN 4
+#define NE_WAN_ENCAP_LEN (sizeof(struct ether_header) + NE_WAN_ENCAP_FID_LEN)
+
+static uint64_t flow_id_from_5tuple(uint32_t src_ip, uint32_t dst_ip, uint16_t src_port,
+                                   uint16_t dst_port, uint8_t protocol) {
+    /* Deterministic 64-bit mix; caller controls uniqueness by how it chooses inputs. */
+    uint64_t x = ((uint64_t)src_ip << 32) ^ (uint64_t)dst_ip;
+    x ^= ((uint64_t)src_port << 48) ^ ((uint64_t)dst_port << 32) ^ (uint64_t)protocol;
+    x ^= x >> 33;
+    x *= 0xff51afd7ed558ccdULL;
+    x ^= x >> 33;
+    x *= 0xc4ceb9fe1a85ec53ULL;
+    x ^= x >> 33;
+    return x;
+}
+
+static uint32_t bswap32_u32(uint32_t x) {
+    return htonl(x);
+}
+
+static int wan_encap_inplace(struct forwarder *fwd, int wan_idx, uint8_t *pkt, uint32_t *pkt_len_io) {
+    if (!fwd || !pkt || !pkt_len_io)
+        return -1;
+    if (wan_idx < 0 || wan_idx >= fwd->wan_count)
+        return -1;
+    if (!fwd->cfg || fwd->cfg->flow_ethertype == 0)
+        return -1;
+
+    struct xsk_interface *wan = &fwd->wans[wan_idx];
+    uint32_t pkt_len = *pkt_len_io;
+    if (pkt_len + (uint32_t)NE_WAN_ENCAP_LEN > (uint32_t)wan->frame_size)
+        return -1;
+
+    uint32_t src_ip, dst_ip;
+    uint16_t src_port, dst_port;
+    uint8_t  proto;
+    uint64_t fid = 0;
+    if (parse_flow(pkt, pkt_len, &src_ip, &dst_ip, &src_port, &dst_port, &proto) == 0)
+        fid = flow_id_from_5tuple(src_ip, dst_ip, src_port, dst_port, proto);
+    else
+        fid = (uint64_t)pkt_len; /* fallback, keeps it deterministic but not flow-sticky */
+
+    /* Shift inner frame right to make room for outer header+flow_id. */
+    memmove(pkt + NE_WAN_ENCAP_LEN, pkt, pkt_len);
+
+    /* Outer Ethernet. */
+    struct ether_header *eth = (struct ether_header *)pkt;
+    memcpy(eth->ether_dhost, wan->dst_mac, MAC_LEN);
+    memcpy(eth->ether_shost, wan->src_mac, MAC_LEN);
+    eth->ether_type = htons(fwd->cfg->flow_ethertype);
+
+    /* flow_id (u32) in big-endian */
+    uint32_t fid32 = (uint32_t)(fid & 0xffffffffu);
+    uint32_t fid_be = bswap32_u32(fid32);
+    memcpy(pkt + sizeof(*eth), &fid_be, sizeof(fid_be));
+
+    *pkt_len_io = pkt_len + (uint32_t)NE_WAN_ENCAP_LEN;
+    return 0;
+}
+
+static int wan_decap_inplace(struct forwarder *fwd, uint8_t *pkt, uint32_t *pkt_len_io) {
+    if (!fwd || !pkt || !pkt_len_io || !fwd->cfg)
+        return -1;
+    if (fwd->cfg->flow_ethertype == 0)
+        return 1; /* nothing to do */
+
+    uint32_t pkt_len = *pkt_len_io;
+    if (pkt_len < (uint32_t)NE_WAN_ENCAP_LEN + (uint32_t)sizeof(struct ether_header))
+        return 1;
+
+    struct ether_header *eth = (struct ether_header *)pkt;
+    if (ntohs(eth->ether_type) != fwd->cfg->flow_ethertype)
+        return 1;
+
+    /* Strip outer eth + flow_id, shift inner frame back. */
+    memmove(pkt, pkt + NE_WAN_ENCAP_LEN, pkt_len - (uint32_t)NE_WAN_ENCAP_LEN);
+    *pkt_len_io = pkt_len - (uint32_t)NE_WAN_ENCAP_LEN;
+    return 0;
 }
 
 static void sigint_handler(int sig) {
@@ -158,7 +252,7 @@ static int select_wan_idx_for_packet(struct forwarder *fwd, uint32_t src_ip, uin
 
 static void *gc_thread(void *arg) {
     struct forwarder *fwd = (struct forwarder *)arg;
-    pin_data_plane_cpu();
+    pin_data_plane_cpu(NE_PLAIN_CPU);
     while (running) {
         sleep(60);
         flow_table_gc(&g_flow_table);
@@ -180,7 +274,7 @@ static void *local_queue_thread_no_crypto(void *arg) {
     struct queue_thread_args *args = (struct queue_thread_args *)arg;
     struct forwarder *fwd          = args->fwd;
 
-    pin_data_plane_cpu();
+    pin_data_plane_cpu(args->cpu_id);
     int local_idx = args->iface_idx;
     int queue_idx = args->queue_idx;
     int tx_base   = args->tx_queue_base;
@@ -222,13 +316,26 @@ static void *local_queue_thread_no_crypto(void *arg) {
             struct xsk_interface *wan = &fwd->wans[wan_idx];
             int                     tq  = wan_tx_q[wan_idx];
             uint8_t                *pkt = (uint8_t *)pkt_ptrs[i];
+            uint32_t                out_len = pkt_lens[i];
 
-            if (set_wan_l2_addrs(fwd, wan_idx, pkt) != 0) {
+            if (fwd->cfg && fwd->cfg->flow_ethertype != 0) {
+                if (wan_encap_inplace(fwd, wan_idx, pkt, &out_len) != 0) {
+                    __sync_fetch_and_add(&fwd->total_dropped, 1);
+                    continue;
+                }
+            } else {
+                if (set_wan_l2_addrs(fwd, wan_idx, pkt) != 0) {
+                    __sync_fetch_and_add(&fwd->total_dropped, 1);
+                    continue;
+                }
+            }
+
+            if (out_len == 0) {
                 __sync_fetch_and_add(&fwd->total_dropped, 1);
                 continue;
             }
 
-            if (interface_send_batch_queue(wan, tq, pkt, pkt_lens[i]) == 0) {
+            if (interface_send_batch_queue(wan, tq, pkt, out_len) == 0) {
                 __sync_fetch_and_add(&fwd->local_to_wan, 1);
                 if (wan_idx >= 0 && wan_idx < MAX_INTERFACES)
                     __sync_fetch_and_add(&fwd->wan_tx_packets[wan_idx], 1);
@@ -251,7 +358,7 @@ static void *wan_queue_thread_no_crypto(void *arg) {
     struct queue_thread_args *args = (struct queue_thread_args *)arg;
     struct forwarder *fwd          = args->fwd;
 
-    pin_data_plane_cpu();
+    pin_data_plane_cpu(args->cpu_id);
     int wan_idx    = args->iface_idx;
     int queue_idx  = args->queue_idx;
     int tx_base    = args->tx_queue_base;
@@ -274,6 +381,8 @@ static void *wan_queue_thread_no_crypto(void *arg) {
         for (int i = 0; i < rcvd; i++) {
             uint8_t *pkt     = (uint8_t *)pkt_ptrs[i];
             uint32_t pkt_len = pkt_lens[i];
+
+            (void)wan_decap_inplace(fwd, pkt, &pkt_len);
 
             uint32_t dest_ip = get_dest_ip(pkt, pkt_len);
             if (dest_ip == 0) {
@@ -334,6 +443,22 @@ static void *wan_queue_thread_no_crypto(void *arg) {
 }
 
 static void forwarder_run_no_crypto(struct forwarder *fwd) {
+    int local_lane_base[MAX_INTERFACES] = {0};
+    int wan_lane_base[MAX_INTERFACES]   = {0};
+    {
+        int acc = 0;
+        for (int i = 0; i < fwd->local_count; i++) {
+            local_lane_base[i] = acc;
+            acc += fwd->locals[i].queue_count;
+        }
+    }
+    {
+        int acc = 0;
+        for (int i = 0; i < fwd->wan_count; i++) {
+            wan_lane_base[i] = acc;
+            acc += fwd->wans[i].queue_count;
+        }
+    }
     int total_lq = 0;
     for (int i = 0; i < fwd->local_count; i++)
         total_lq += fwd->locals[i].queue_count;
@@ -359,11 +484,17 @@ static void forwarder_run_no_crypto(struct forwarder *fwd) {
     for (int i = 0; i < fwd->local_count; i++) {
         struct xsk_interface *loc = &fwd->locals[i];
         for (int q = 0; q < loc->queue_count; q++) {
+            int lane = local_lane_base[i] + q;
             args[thread_idx].fwd              = fwd;
             args[thread_idx].iface_idx        = i;
             args[thread_idx].queue_idx        = q;
-            args[thread_idx].tx_queue_base    = q;
+            args[thread_idx].lane_id          = lane;
+            args[thread_idx].tx_queue_base    = lane;
             args[thread_idx].wan_worker_index = -1;
+            if (fwd->cfg && fwd->cfg->cpu_lane_base >= 0)
+                args[thread_idx].cpu_id = fwd->cfg->cpu_lane_base + lane;
+            else
+                args[thread_idx].cpu_id = (fwd->cfg ? (fwd->cfg->cpu_local_base + q) : NE_PLAIN_CPU);
             pthread_create(&threads[thread_idx], NULL, local_queue_thread_no_crypto,
                            &args[thread_idx]);
             thread_idx++;
@@ -374,11 +505,17 @@ static void forwarder_run_no_crypto(struct forwarder *fwd) {
     for (int i = 0; i < fwd->wan_count; i++) {
         struct xsk_interface *w = &fwd->wans[i];
         for (int q = 0; q < w->queue_count; q++) {
+            int lane = wan_lane_base[i] + q;
             args[thread_idx].fwd              = fwd;
             args[thread_idx].iface_idx        = i;
             args[thread_idx].queue_idx        = q;
-            args[thread_idx].tx_queue_base    = q;
+            args[thread_idx].lane_id          = lane;
+            args[thread_idx].tx_queue_base    = lane;
             args[thread_idx].wan_worker_index = wan_worker_idx++;
+            if (fwd->cfg && fwd->cfg->cpu_lane_base >= 0)
+                args[thread_idx].cpu_id = fwd->cfg->cpu_lane_base + lane;
+            else
+                args[thread_idx].cpu_id = (fwd->cfg ? (fwd->cfg->cpu_wan_base + q) : NE_PLAIN_CPU);
             pthread_create(&threads[thread_idx], NULL, wan_queue_thread_no_crypto,
                            &args[thread_idx]);
             thread_idx++;
@@ -400,10 +537,7 @@ int forwarder_init(struct forwarder *fwd, struct app_config *cfg) {
     fwd->cfg = cfg;
     interface_reset_redirect_maps();
 
-    for (int i = 0; i < cfg->local_count; i++)
-        cfg->locals[i].queue_count = 1;
-    for (int i = 0; i < cfg->wan_count; i++)
-        cfg->wans[i].queue_count = 1;
+    /* queue_count is configured in config_file.c (or defaults) */
 
     uint32_t wan_window_sizes[MAX_INTERFACES] = {0};
     for (int i = 0; i < cfg->wan_count && i < MAX_INTERFACES; i++)
