@@ -97,6 +97,12 @@ int xdp_wan_redirect_prog(struct xdp_md *ctx)
         goto redirect;
     }
 
+    /* Encapsulated NE frames (outer EtherType = encap_ethertype) should be redirected too. */
+    __u32 k3_pre = 3;
+    __u16 *encap_etp = bpf_map_lookup_elem(&wan_config_map, &k3_pre);
+    if (encap_etp && *encap_etp != 0 && proto == bpf_htons(*encap_etp))
+        goto redirect;
+
     __u32 key0 = 0, key1 = 1;
     __u16 *fake4 = bpf_map_lookup_elem(&wan_config_map, &key0);
     if (fake4 && *fake4 != 0 &&
@@ -122,7 +128,7 @@ redirect:
     __u16 *qcountp = bpf_map_lookup_elem(&wan_config_map, &k2);
     __u16 *etp     = bpf_map_lookup_elem(&wan_config_map, &k3);
     __u32 queue_id = ctx->rx_queue_index;
-    if (etp && *etp != 0 && proto == __constant_htons(*etp)) {
+    if (etp && *etp != 0 && proto == bpf_htons(*etp)) {
         if ((__u8 *)nh + 4 <= (__u8 *)data_end) {
             __u32 fid_net;
             __builtin_memcpy(&fid_net, nh, sizeof(fid_net));
