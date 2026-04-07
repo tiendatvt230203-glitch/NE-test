@@ -3,6 +3,8 @@ CLANG     = clang
 CFLAGS    = -D_GNU_SOURCE -Iinc -Wall -O2
 LDFLAGS   = -lbpf -lxdp -pthread
 
+# Môi trường header libbpf 1.x nhưng .so cũ (thiếu bpf_xdp_attach): make CFLAGS+=' -DNE_PLAIN_BPF_XDP_LEGACY'
+
 BPF_CFLAGS     = -O2 -target bpf -g
 KERNEL_HEADERS = /usr/include
 

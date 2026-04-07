@@ -20,6 +20,37 @@ static int ether_macs_nonzero(const void *pkt, uint32_t pkt_len) {
 #include <linux/sockios.h>
 #include <linux/if.h>
 
+#ifdef __has_include
+#if __has_include(<bpf/libbpf_version.h>)
+#include <bpf/libbpf_version.h>
+#endif
+#endif
+
+#if defined(NE_PLAIN_BPF_XDP_LEGACY)
+#define NE_PLAIN_USE_MODERN_XDP 0
+#elif defined(LIBBPF_MAJOR_VERSION) && (LIBBPF_MAJOR_VERSION >= 1)
+#define NE_PLAIN_USE_MODERN_XDP 1
+#else
+#define NE_PLAIN_USE_MODERN_XDP 0
+#endif
+
+static int iface_xdp_attach(int ifindex, int prog_fd, __u32 flags)
+{
+#if NE_PLAIN_USE_MODERN_XDP
+    return bpf_xdp_attach(ifindex, prog_fd, flags, NULL);
+#else
+    return bpf_set_link_xdp_fd(ifindex, prog_fd, flags);
+#endif
+}
+
+static int iface_xdp_detach(int ifindex, __u32 flags)
+{
+#if NE_PLAIN_USE_MODERN_XDP
+    return bpf_xdp_detach(ifindex, flags, NULL);
+#else
+    return bpf_set_link_xdp_fd(ifindex, -1, flags);
+#endif
+}
 
 static int config_map_fds[MAX_INTERFACES];
 static int config_map_fd_count = 0;
@@ -47,7 +78,7 @@ static void interface_xdp_try_detach(int ifindex, const char *ifname) {
         XDP_FLAGS_HW_MODE,
     };
     for (size_t i = 0; i < sizeof(modes) / sizeof(modes[0]); i++) {
-        int r = bpf_xdp_detach(ifindex, modes[i], NULL);
+        int r = iface_xdp_detach(ifindex, modes[i]);
         if (r < 0) {
             int e = -r;
             if (e != EINVAL && e != EOPNOTSUPP && e != ENODEV && e != ENOENT && ifname)
@@ -335,9 +366,9 @@ int interface_init_local(struct xsk_interface *iface,
 
     prog = bpf_object__find_program_by_name(bpf_obj, "xdp_redirect_prog");
     prog_fd = bpf_program__fd(prog);
-    ret = bpf_xdp_attach(iface->ifindex, prog_fd, XDP_FLAGS_SKB_MODE, NULL);
+    ret = iface_xdp_attach(iface->ifindex, prog_fd, XDP_FLAGS_SKB_MODE);
     if (ret) {
-        fprintf(stderr, "bpf_xdp_attach failed: %d (%s)\n", ret,
+        fprintf(stderr, "XDP attach failed: %d (%s)\n", ret,
                 ret < 0 ? strerror(-ret) : "non-negative");
         goto err_queues;
     }
@@ -578,9 +609,9 @@ int interface_init_wan_rx(struct xsk_interface *iface,
         iface->queue_count++;
     }
 
-    ret = bpf_xdp_attach(iface->ifindex, prog_fd, XDP_FLAGS_SKB_MODE, NULL);
+    ret = iface_xdp_attach(iface->ifindex, prog_fd, XDP_FLAGS_SKB_MODE);
     if (ret) {
-        fprintf(stderr, "WAN bpf_xdp_attach failed: %d\n", ret);
+        fprintf(stderr, "WAN XDP attach failed: %d\n", ret);
         goto err_queues;
     }
 
