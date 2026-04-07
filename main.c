@@ -1,11 +1,27 @@
 #include "forwarder.h"
 #include "config.h"
+#include <bpf/libbpf.h>
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <pthread.h>
 #include <sched.h>
 
+static int ne_plain_libbpf_print(enum libbpf_print_level level, const char *fmt, va_list ap) {
+    va_list aq;
+    va_copy(aq, ap);
+    char buf[768];
+    vsnprintf(buf, sizeof buf, fmt, aq);
+    va_end(aq);
+    if (strstr(buf, "Retrying without BTF") != NULL)
+        return 0;
+    return vfprintf(stderr, fmt, ap);
+}
+
 int main(int argc, char **argv) {
+    libbpf_set_print(ne_plain_libbpf_print);
+
     if (argc != 2) {
         fprintf(stderr, "usage: %s <config.cfg>\n", argv[0] ? argv[0] : "ne-plain");
         return EXIT_FAILURE;
