@@ -521,7 +521,7 @@ int interface_init_wan_rx(struct xsk_interface *iface,
     map = bpf_object__find_map_by_name(wan_bpf_obj, "wan_config_map");
     if (map) {
         int cfg_fd = bpf_map__fd(map);
-        int key0 = 0, key1 = 1;
+        uint32_t key0 = 0, key1 = 1;
         uint16_t fake4_net = htons(fake_ethertype_ipv4);
         uint16_t fake6_net = htons(fake_ethertype_ipv6);
         bpf_map_update_elem(cfg_fd, &key0, &fake4_net, 0);
@@ -583,7 +583,8 @@ int interface_init_wan_rx(struct xsk_interface *iface,
         }
 
         int fd = xsk_socket__fd(queue->xsk);
-        ret = bpf_map_update_elem(wan_xsk_map_fd, &q, &fd, 0);
+        uint32_t q_u = (uint32_t)q, fd_u = (uint32_t)fd;
+        ret = bpf_map_update_elem(wan_xsk_map_fd, &q_u, &fd_u, 0);
         if (ret) {
             fprintf(stderr, "WAN Queue %d: bpf_map_update_elem failed\n", q);
             xsk_socket__delete(queue->xsk);

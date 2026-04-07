@@ -15,6 +15,7 @@ struct forwarder {
     uint64_t local_to_wan;
     uint64_t wan_to_local;
     uint64_t total_dropped;
+    uint64_t wan_tx_packets[MAX_INTERFACES];
 };
 
 int  forwarder_init(struct forwarder *fwd, struct app_config *cfg);

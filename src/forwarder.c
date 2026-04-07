@@ -4,6 +4,7 @@
 #include <errno.h>
 #include <pthread.h>
 #include <signal.h>
+#include <stdlib.h>
 #include <sched.h>
 #include <unistd.h>
 #include <arpa/inet.h>
@@ -156,11 +157,21 @@ static int select_wan_idx_for_packet(struct forwarder *fwd, uint32_t src_ip, uin
 }
 
 static void *gc_thread(void *arg) {
-    (void)arg;
+    struct forwarder *fwd = (struct forwarder *)arg;
     pin_data_plane_cpu();
     while (running) {
         sleep(60);
         flow_table_gc(&g_flow_table);
+        if (fwd && getenv("NE_PLAIN_DEBUG_WAN") != NULL) {
+            fprintf(stderr,
+                    "[ne-plain][wan-debug] local_to_wan=%llu wan_to_local=%llu dropped=%llu",
+                    (unsigned long long)fwd->local_to_wan, (unsigned long long)fwd->wan_to_local,
+                    (unsigned long long)fwd->total_dropped);
+            for (int w = 0; w < fwd->wan_count; w++)
+                fprintf(stderr, " | %s pkts=%llu", fwd->wans[w].ifname,
+                        (unsigned long long)fwd->wan_tx_packets[w]);
+            fprintf(stderr, "\n");
+        }
     }
     return NULL;
 }
@@ -219,6 +230,8 @@ static void *local_queue_thread_no_crypto(void *arg) {
 
             if (interface_send_batch_queue(wan, tq, pkt, pkt_lens[i]) == 0) {
                 __sync_fetch_and_add(&fwd->local_to_wan, 1);
+                if (wan_idx >= 0 && wan_idx < MAX_INTERFACES)
+                    __sync_fetch_and_add(&fwd->wan_tx_packets[wan_idx], 1);
                 wan_used[wan_idx] = 1;
             } else
                 __sync_fetch_and_add(&fwd->total_dropped, 1);
@@ -340,7 +353,7 @@ static void forwarder_run_no_crypto(struct forwarder *fwd) {
     }
 
     pthread_t gc_tid;
-    pthread_create(&gc_tid, NULL, gc_thread, NULL);
+    pthread_create(&gc_tid, NULL, gc_thread, fwd);
 
     int thread_idx = 0;
     for (int i = 0; i < fwd->local_count; i++) {
@@ -422,6 +435,15 @@ int forwarder_init(struct forwarder *fwd, struct app_config *cfg) {
         }
         fwd->wan_count++;
     }
+
+    fprintf(stderr, "[ne-plain] %d local(s), %d WAN(s)", cfg->local_count, cfg->wan_count);
+    for (int i = 0; i < cfg->wan_count; i++)
+        fprintf(stderr, " | %s window=%u KiB (%u bytes)", cfg->wans[i].ifname,
+                cfg->wans[i].window_size / 1024u, cfg->wans[i].window_size);
+    fprintf(stderr, "\n");
+    fprintf(stderr,
+            "[ne-plain] hint: set NE_PLAIN_DEBUG_WAN=1 for per-WAN TX packet counts every 60s; "
+            "window rotates per TCP/UDP flow after cumulative bytes reach each WAN window.\n");
 
     return 0;
 

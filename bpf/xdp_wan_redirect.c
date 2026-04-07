@@ -9,21 +9,21 @@
 struct {
     __uint(type, BPF_MAP_TYPE_XSKMAP);
     __uint(max_entries, 8);
-    __type(key, int);
-    __type(value, int);
+    __type(key, __u32);
+    __type(value, __u32);
 } wan_xsks_map SEC(".maps");
 
 struct {
     __uint(type, BPF_MAP_TYPE_ARRAY);
     __uint(max_entries, 8);
-    __type(key, int);
+    __type(key, __u32);
     __type(value, __u64);
 } wan_stats_map SEC(".maps");
 
 struct {
     __uint(type, BPF_MAP_TYPE_ARRAY);
     __uint(max_entries, 2);
-    __type(key, int);
+    __type(key, __u32);
     __type(value, __u16);
 } wan_config_map SEC(".maps");
 
@@ -35,7 +35,7 @@ struct {
 #define STAT_ICMP_PASS  5
 #define IPPROTO_ICMP_VAL 1
 
-static __always_inline void inc_stat(int idx)
+static __always_inline void inc_stat(__u32 idx)
 {
     __u64 *val = bpf_map_lookup_elem(&wan_stats_map, &idx);
     if (val)
@@ -92,7 +92,7 @@ int xdp_wan_redirect_prog(struct xdp_md *ctx)
         goto redirect;
     }
 
-    int key0 = 0, key1 = 1;
+    __u32 key0 = 0, key1 = 1;
     __u16 *fake4 = bpf_map_lookup_elem(&wan_config_map, &key0);
     if (fake4 && *fake4 != 0 &&
         (proto & __constant_htons(0xFF00)) == (*fake4 & __constant_htons(0xFF00)))
@@ -109,7 +109,7 @@ int xdp_wan_redirect_prog(struct xdp_md *ctx)
 redirect:
     ;
 
-    int queue_id = 0;
+    __u32 queue_id = 0;
     int ret = bpf_redirect_map(&wan_xsks_map, queue_id, XDP_PASS);
 
     if (ret == XDP_REDIRECT) {
