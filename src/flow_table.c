@@ -124,7 +124,6 @@ int flow_table_get_wan(struct flow_table *ft,
                        uint32_t src_ip, uint32_t dst_ip,
                        uint16_t src_port, uint16_t dst_port,
                        uint8_t protocol, uint32_t pkt_len) {
-    /* WAN selection must be IP-only (src_ip/dst_ip), not 5-tuple. */
     normalize_flow_ips(&src_ip, &dst_ip);
     uint32_t idx = flow_hash_ips(src_ip, dst_ip);
     uint64_t now = get_time_sec();
@@ -232,9 +231,6 @@ int flow_table_get_wan_profile(struct flow_table *ft,
     if (allowed_count == 1)
         return allowed_wans[0];
 
-    /* Per-connection WAN selection: use normalized 5-tuple so both directions
-     * map to the same bucket/key, but each TCP/UDP flow is independent.
-     */
     normalize_flow_5tuple(&src_ip, &dst_ip, &src_port, &dst_port);
     uint32_t idx = flow_hash(src_ip, dst_ip, src_port, dst_port, protocol);
     uint64_t now = get_time_sec();

@@ -1,6 +1,5 @@
 #include "../inc/forwarder.h"
 #include "../inc/flow_table.h"
-#include "../inc/wan_arp.h"
 
 #include <errno.h>
 #include <pthread.h>
@@ -15,36 +14,41 @@
 
 static volatile int running            = 1;
 static struct flow_table g_flow_table;
-static struct arp_cache g_arp[MAX_INTERFACES];
-static struct arp_cache g_wan_arp[MAX_INTERFACES];
 
 struct queue_thread_args {
     struct forwarder *fwd;
     int               iface_idx;
     int               queue_idx;
     int               tx_queue_base;
-    int               core_id;
     int               wan_worker_index;
 };
 
-static void pin_core0(void) {
+static void pin_data_plane_cpu(void) {
     cpu_set_t cpuset;
     CPU_ZERO(&cpuset);
-    CPU_SET(0, &cpuset);
+    CPU_SET(NE_PLAIN_CPU, &cpuset);
     (void)pthread_setaffinity_np(pthread_self(), sizeof(cpuset), &cpuset);
+}
+
+static int l2_macs_nonzero(const uint8_t *dmac, const uint8_t *smac) {
+    int d = dmac[0] | dmac[1] | dmac[2] | dmac[3] | dmac[4] | dmac[5];
+    int s = smac[0] | smac[1] | smac[2] | smac[3] | smac[4] | smac[5];
+    return d != 0 && s != 0;
+}
+
+static int l2_rewrite_ether(uint8_t *pkt, const uint8_t *dmac, const uint8_t *smac) {
+    if (!pkt || !l2_macs_nonzero(dmac, smac))
+        return -1;
+    memcpy(pkt, dmac, MAC_LEN);
+    memcpy(pkt + MAC_LEN, smac, MAC_LEN);
+    return 0;
 }
 
 static int set_wan_l2_addrs(struct forwarder *fwd, int wan_idx, uint8_t *pkt) {
     if (!fwd || wan_idx < 0 || wan_idx >= fwd->wan_count)
         return -1;
-    return wan_rewrite_dest_mac(&g_wan_arp[wan_idx], &fwd->cfg->wans[wan_idx],
-                                &fwd->wans[wan_idx], pkt);
-}
-
-static void log_wan_peer_mac(struct forwarder *fwd, int wan_idx) {
-    if (!fwd || wan_idx < 0 || wan_idx >= fwd->wan_count)
-        return;
-    wan_log_peer_mac(&g_wan_arp[wan_idx], fwd->wans[wan_idx].ifname, &fwd->cfg->wans[wan_idx]);
+    struct xsk_interface *w = &fwd->wans[wan_idx];
+    return l2_rewrite_ether(pkt, w->dst_mac, w->src_mac);
 }
 
 static void sigint_handler(int sig) {
@@ -135,14 +139,25 @@ static inline uint32_t flow_hash_local_tq(uint32_t src_ip, uint32_t dst_ip, uint
 static int select_wan_idx_for_packet(struct forwarder *fwd, uint32_t src_ip, uint32_t dst_ip,
                                      uint16_t src_port, uint16_t dst_port, uint8_t protocol,
                                      uint32_t pkt_len) {
-    (void)fwd;
-    return flow_table_get_wan(&g_flow_table, src_ip, dst_ip, src_port, dst_port, protocol,
-                              pkt_len);
+    if (!fwd || fwd->wan_count <= 0)
+        return 0;
+    if (fwd->wan_count == 1)
+        return 0;
+
+    int allowed[MAX_INTERFACES];
+    int n = fwd->wan_count;
+    if (n > MAX_INTERFACES)
+        n = MAX_INTERFACES;
+    for (int i = 0; i < n; i++)
+        allowed[i] = i;
+
+    return flow_table_get_wan_profile(&g_flow_table, src_ip, dst_ip, src_port, dst_port, protocol,
+                                      pkt_len, allowed, n, NULL);
 }
 
 static void *gc_thread(void *arg) {
     (void)arg;
-    pin_core0();
+    pin_data_plane_cpu();
     while (running) {
         sleep(60);
         flow_table_gc(&g_flow_table);
@@ -154,7 +169,7 @@ static void *local_queue_thread_no_crypto(void *arg) {
     struct queue_thread_args *args = (struct queue_thread_args *)arg;
     struct forwarder *fwd          = args->fwd;
 
-    pin_core0();
+    pin_data_plane_cpu();
     int local_idx = args->iface_idx;
     int queue_idx = args->queue_idx;
     int tx_base   = args->tx_queue_base;
@@ -223,7 +238,7 @@ static void *wan_queue_thread_no_crypto(void *arg) {
     struct queue_thread_args *args = (struct queue_thread_args *)arg;
     struct forwarder *fwd          = args->fwd;
 
-    pin_core0();
+    pin_data_plane_cpu();
     int wan_idx    = args->iface_idx;
     int queue_idx  = args->queue_idx;
     int tx_base    = args->tx_queue_base;
@@ -279,14 +294,8 @@ static void *wan_queue_thread_no_crypto(void *arg) {
                                                      : (tx_base % nq);
             }
 
-            uint8_t dst_mac[6];
-            if (arp_cache_lookup(&g_arp[local_idx], dest_ip, dst_mac)) {
-                memcpy(pkt, dst_mac, 6);
-                memcpy(pkt + 6, g_arp[local_idx].if_mac, 6);
-            } else {
-                arp_send_request(&g_arp[local_idx], dest_ip);
+            if (l2_rewrite_ether(pkt, local_cfg->dst_mac, local_cfg->src_mac) != 0) {
                 __sync_fetch_and_add(&fwd->total_dropped, 1);
-                interface_recv_release_single_queue(wan, queue_idx, &addrs[i], 1);
                 continue;
             }
 
@@ -341,7 +350,6 @@ static void forwarder_run_no_crypto(struct forwarder *fwd) {
             args[thread_idx].iface_idx        = i;
             args[thread_idx].queue_idx        = q;
             args[thread_idx].tx_queue_base    = q;
-            args[thread_idx].core_id          = 0;
             args[thread_idx].wan_worker_index = -1;
             pthread_create(&threads[thread_idx], NULL, local_queue_thread_no_crypto,
                            &args[thread_idx]);
@@ -357,7 +365,6 @@ static void forwarder_run_no_crypto(struct forwarder *fwd) {
             args[thread_idx].iface_idx        = i;
             args[thread_idx].queue_idx        = q;
             args[thread_idx].tx_queue_base    = q;
-            args[thread_idx].core_id          = 0;
             args[thread_idx].wan_worker_index = wan_worker_idx++;
             pthread_create(&threads[thread_idx], NULL, wan_queue_thread_no_crypto,
                            &args[thread_idx]);
@@ -408,31 +415,12 @@ int forwarder_init(struct forwarder *fwd, struct app_config *cfg) {
             fprintf(stderr, "[XDP] redirect map update failed (optional)\n");
     }
 
-    for (int i = 0; i < fwd->local_count; i++) {
-        if (arp_init_for_local(&g_arp[i], &fwd->locals[i], &running) == 0) {
-            pthread_t tid;
-            pthread_create(&tid, NULL, arp_listener_thread, &g_arp[i]);
-            pthread_detach(tid);
-        }
-    }
-
     for (int i = 0; i < cfg->wan_count; i++) {
         if (interface_init_wan_rx(&fwd->wans[i], &cfg->wans[i], cfg->bpf_wan_o, 0, 0) != 0) {
             fprintf(stderr, "init WAN %s failed\n", cfg->wans[i].ifname);
             goto err;
         }
         fwd->wan_count++;
-    }
-
-    for (int i = 0; i < fwd->wan_count; i++) {
-        if (cfg->wans[i].dst_ip == 0)
-            continue;
-        if (arp_init_for_local(&g_wan_arp[i], &fwd->wans[i], &running) == 0) {
-            pthread_t tid;
-            pthread_create(&tid, NULL, arp_listener_thread, &g_wan_arp[i]);
-            pthread_detach(tid);
-            log_wan_peer_mac(fwd, i);
-        }
     }
 
     return 0;

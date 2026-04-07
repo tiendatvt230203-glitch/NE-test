@@ -2,11 +2,20 @@
 #include "config.h"
 #include <stdio.h>
 #include <stdlib.h>
+#include <pthread.h>
+#include <sched.h>
 
 int main(int argc, char **argv) {
     if (argc != 2) {
         fprintf(stderr, "usage: %s <config.cfg>\n", argv[0] ? argv[0] : "ne-plain");
         return EXIT_FAILURE;
+    }
+
+    {
+        cpu_set_t cpuset;
+        CPU_ZERO(&cpuset);
+        CPU_SET(NE_PLAIN_CPU, &cpuset);
+        (void)pthread_setaffinity_np(pthread_self(), sizeof(cpuset), &cpuset);
     }
 
     struct app_config cfg;

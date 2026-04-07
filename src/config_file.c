@@ -113,15 +113,7 @@ int config_load_file(const char *path, struct app_config *cfg) {
                 struct wan_config *W = &cfg->wans[idx];
                 if (strcmp(suffix, "ifname") == 0)
                     snprintf(W->ifname, sizeof(W->ifname), "%s", val);
-                else if (strcmp(suffix, "dst_ip") == 0) {
-                    if (strcmp(val, "0") == 0 || strcasecmp(val, "none") == 0)
-                        W->dst_ip = 0;
-                    else {
-                        struct in_addr a;
-                        if (inet_pton(AF_INET, val, &a) == 1)
-                            W->dst_ip = a.s_addr;
-                    }
-                } else if (strcmp(suffix, "src_mac") == 0)
+                else if (strcmp(suffix, "src_mac") == 0)
                     (void)parse_mac(val, W->src_mac);
                 else if (strcmp(suffix, "dst_mac") == 0)
                     (void)parse_mac(val, W->dst_mac);
@@ -171,6 +163,20 @@ int config_load_file(const char *path, struct app_config *cfg) {
     return 0;
 }
 
+static int mac_nonzero_u8(const uint8_t *m) {
+    return (m[0] | m[1] | m[2] | m[3] | m[4] | m[5]) != 0;
+}
+
+static int local_cidr_overlap(uint32_t net1, uint32_t mask1, uint32_t net2, uint32_t mask2) {
+    uint32_t a  = ntohl(net1);
+    uint32_t ma = ntohl(mask1);
+    uint32_t b  = ntohl(net2);
+    uint32_t mb = ntohl(mask2);
+    uint32_t a_hi = a | ~ma;
+    uint32_t b_hi = b | ~mb;
+    return (a <= b_hi && b <= a_hi);
+}
+
 int config_validate(struct app_config *cfg) {
     if (!cfg)
         return -1;
@@ -188,6 +194,25 @@ int config_validate(struct app_config *cfg) {
             fprintf(stderr, "[cfg] local[%s] cidr missing\n", L->ifname);
             return -1;
         }
+        if (!mac_nonzero_u8(L->src_mac)) {
+            fprintf(stderr, "[cfg] local[%s] src_mac missing or zero\n", L->ifname);
+            return -1;
+        }
+        if (!mac_nonzero_u8(L->dst_mac)) {
+            fprintf(stderr, "[cfg] local[%s] dst_mac missing or zero\n", L->ifname);
+            return -1;
+        }
+    }
+    for (int i = 0; i < cfg->local_count; i++) {
+        for (int j = i + 1; j < cfg->local_count; j++) {
+            struct local_config *A = &cfg->locals[i];
+            struct local_config *B = &cfg->locals[j];
+            if (local_cidr_overlap(A->network, A->netmask, B->network, B->netmask)) {
+                fprintf(stderr, "[cfg] local subnets overlap (%s vs %s); dest_ip could match twice\n",
+                        A->ifname, B->ifname);
+                return -1;
+            }
+        }
     }
     for (int i = 0; i < cfg->wan_count; i++) {
         struct wan_config *W = &cfg->wans[i];
@@ -197,6 +222,14 @@ int config_validate(struct app_config *cfg) {
         }
         if (W->window_size == 0) {
             fprintf(stderr, "[cfg] wan[%s] window_kb/window_size missing\n", W->ifname);
+            return -1;
+        }
+        if (!mac_nonzero_u8(W->src_mac)) {
+            fprintf(stderr, "[cfg] wan[%s] src_mac missing or zero\n", W->ifname);
+            return -1;
+        }
+        if (!mac_nonzero_u8(W->dst_mac)) {
+            fprintf(stderr, "[cfg] wan[%s] dst_mac missing or zero\n", W->ifname);
             return -1;
         }
     }

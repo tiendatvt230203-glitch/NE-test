@@ -9,8 +9,7 @@ KERNEL_HEADERS = /usr/include
 BIN_DIR = bin
 TARGET  = $(BIN_DIR)/ne-plain
 
-SRC     = main.c src/config_file.c src/forwarder.c src/interface.c src/flow_table.c \
-          src/wan_arp.c
+SRC     = main.c src/config_file.c src/forwarder.c src/interface.c src/flow_table.c
 OBJ     = $(SRC:.c=.o)
 
 BPF_SRC = bpf/xdp_redirect.c bpf/xdp_wan_redirect.c

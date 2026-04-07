@@ -112,7 +112,6 @@ int interface_send_to_local_batch_queue(struct xsk_interface *iface,
 
 void interface_reset_redirect_maps(void);
 
-/* Update XDP redirect config map with CIDR rules (cfg->redirect) */
 int interface_push_redirect_cfg(const struct redirect_cfg *rcfg);
 
 

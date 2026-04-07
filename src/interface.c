@@ -2,6 +2,17 @@
 #include <poll.h>
 #include <sched.h>
 #include <net/ethernet.h>
+
+static int ether_macs_nonzero(const void *pkt, uint32_t pkt_len) {
+    if (pkt_len < sizeof(struct ether_header))
+        return 0;
+    const struct ether_header *eth = (const struct ether_header *)pkt;
+    int d = eth->ether_dhost[0] | eth->ether_dhost[1] | eth->ether_dhost[2] |
+            eth->ether_dhost[3] | eth->ether_dhost[4] | eth->ether_dhost[5];
+    int s = eth->ether_shost[0] | eth->ether_shost[1] | eth->ether_shost[2] |
+            eth->ether_shost[3] | eth->ether_shost[4] | eth->ether_shost[5];
+    return d != 0 && s != 0;
+}
 #include <unistd.h>
 #include <errno.h>
 #include <sys/ioctl.h>
@@ -1070,6 +1081,24 @@ int interface_send_batch_queue(struct xsk_interface *iface, int queue_idx,
                                 void *pkt_data, uint32_t pkt_len) {
     if (queue_idx >= iface->queue_count)
         return -1;
+    if (pkt_len < sizeof(struct ether_header))
+        return -1;
+
+    int have_dst = (iface->dst_mac[0] | iface->dst_mac[1] | iface->dst_mac[2] |
+                    iface->dst_mac[3] | iface->dst_mac[4] | iface->dst_mac[5]);
+    int have_src = (iface->src_mac[0] | iface->src_mac[1] | iface->src_mac[2] |
+                    iface->src_mac[3] | iface->src_mac[4] | iface->src_mac[5]);
+
+    {
+        struct ether_header eh;
+        memcpy(&eh, pkt_data, sizeof(eh));
+        if (have_dst)
+            memcpy(eh.ether_dhost, iface->dst_mac, MAC_LEN);
+        if (have_src)
+            memcpy(eh.ether_shost, iface->src_mac, MAC_LEN);
+        if (!ether_macs_nonzero(&eh, sizeof(eh)))
+            return -1;
+    }
 
     struct xsk_queue *queue = &iface->queues[queue_idx];
     uint32_t idx;
@@ -1119,10 +1148,6 @@ int interface_send_batch_queue(struct xsk_interface *iface, int queue_idx,
         memcpy(tx_buf, pkt_data, pkt_len);
 
         eth = (struct ether_header *)tx_buf;
-        int have_dst = (iface->dst_mac[0] | iface->dst_mac[1] | iface->dst_mac[2] |
-                        iface->dst_mac[3] | iface->dst_mac[4] | iface->dst_mac[5]);
-        int have_src = (iface->src_mac[0] | iface->src_mac[1] | iface->src_mac[2] |
-                        iface->src_mac[3] | iface->src_mac[4] | iface->src_mac[5]);
 
         if (have_dst)
             memcpy(eth->ether_dhost, iface->dst_mac, MAC_LEN);
@@ -1165,12 +1190,16 @@ int interface_send_to_local_batch_queue(struct xsk_interface *iface,
                                          int queue_idx,
                                          const struct local_config *local_cfg,
                                          void *pkt_data, uint32_t pkt_len) {
+    (void)local_cfg;
     if (queue_idx >= iface->queue_count)
+        return -1;
+    if (pkt_len < sizeof(struct ether_header))
+        return -1;
+    if (!ether_macs_nonzero(pkt_data, pkt_len))
         return -1;
 
     struct xsk_queue *queue = &iface->queues[queue_idx];
     uint32_t idx;
-    struct ether_header *eth;
 
 #define LOCAL_TX_MAX_WAIT_LOOPS  10000
 
@@ -1212,16 +1241,6 @@ int interface_send_to_local_batch_queue(struct xsk_interface *iface,
 
         void *tx_buf = (uint8_t *)queue->bufs + addr;
         memcpy(tx_buf, pkt_data, pkt_len);
-
-        eth = (struct ether_header *)tx_buf;
-    if (local_cfg->dst_mac[0] | local_cfg->dst_mac[1] | local_cfg->dst_mac[2] |
-        local_cfg->dst_mac[3] | local_cfg->dst_mac[4] | local_cfg->dst_mac[5]) {
-        memcpy(eth->ether_dhost, local_cfg->dst_mac, MAC_LEN);
-    }
-    if (local_cfg->src_mac[0] | local_cfg->src_mac[1] | local_cfg->src_mac[2] |
-        local_cfg->src_mac[3] | local_cfg->src_mac[4] | local_cfg->src_mac[5]) {
-        memcpy(eth->ether_shost, local_cfg->src_mac, MAC_LEN);
-    }
 
         xsk_ring_prod__tx_desc(&queue->tx, idx)->addr = addr;
         xsk_ring_prod__tx_desc(&queue->tx, idx)->len = pkt_len;

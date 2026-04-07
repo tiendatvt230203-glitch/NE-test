@@ -4,6 +4,8 @@
 #include <stdint.h>
 #include <net/if.h>
 
+#define NE_PLAIN_CPU 0
+
 #define MAX_INTERFACES 16
 #define MAC_LEN        6
 #define MAX_BATCH_SIZE 1024
@@ -43,7 +45,6 @@ struct local_config {
 
 struct wan_config {
     char     ifname[IF_NAMESIZE];
-    uint32_t dst_ip;
     uint8_t  src_mac[MAC_LEN];
     uint8_t  dst_mac[MAC_LEN];
     uint32_t window_size;
