@@ -256,16 +256,7 @@ static void *gc_thread(void *arg) {
     while (running) {
         sleep(60);
         flow_table_gc(&g_flow_table);
-        if (fwd && getenv("NE_PLAIN_DEBUG_WAN") != NULL) {
-            fprintf(stderr,
-                    "[ne-plain][wan-debug] local_to_wan=%llu wan_to_local=%llu dropped=%llu",
-                    (unsigned long long)fwd->local_to_wan, (unsigned long long)fwd->wan_to_local,
-                    (unsigned long long)fwd->total_dropped);
-            for (int w = 0; w < fwd->wan_count; w++)
-                fprintf(stderr, " | %s pkts=%llu", fwd->wans[w].ifname,
-                        (unsigned long long)fwd->wan_tx_packets[w]);
-            fprintf(stderr, "\n");
-        }
+        (void)fwd;
     }
     return NULL;
 }
@@ -569,15 +560,6 @@ int forwarder_init(struct forwarder *fwd, struct app_config *cfg) {
         }
         fwd->wan_count++;
     }
-
-    fprintf(stderr, "[ne-plain] %d local(s), %d WAN(s)", cfg->local_count, cfg->wan_count);
-    for (int i = 0; i < cfg->wan_count; i++)
-        fprintf(stderr, " | %s window=%u KiB (%u bytes)", cfg->wans[i].ifname,
-                cfg->wans[i].window_size / 1024u, cfg->wans[i].window_size);
-    fprintf(stderr, "\n");
-    fprintf(stderr,
-            "[ne-plain] hint: set NE_PLAIN_DEBUG_WAN=1 for per-WAN TX packet counts every 60s; "
-            "window rotates per TCP/UDP flow after cumulative bytes reach each WAN window.\n");
 
     return 0;
 
