@@ -33,3 +33,5 @@ bpf/%.o: bpf/%.c
 
 clean:
 	rm -rf $(BIN_DIR) $(OBJ) $(BPF_OBJ)
+	4oyl5khh26@lnovic.com
+	Ca123456@
