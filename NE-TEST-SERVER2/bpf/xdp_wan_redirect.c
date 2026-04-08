@@ -3,6 +3,7 @@
 #include <linux/ip.h>
 #include <linux/in.h>
 #include <linux/ipv6.h>
+#include <linux/tcp.h>
 #include <linux/udp.h>
 #include <bpf/bpf_helpers.h>
 #include <bpf/bpf_endian.h>
@@ -21,6 +22,13 @@ struct {
     __type(value, __u64);
 } wan_stats_map SEC(".maps");
 
+/*
+ * wan_config_map layout:
+ *   [0] = fake_ethertype_ipv4 (u16, network-byte-order) — unused, kept for compat
+ *   [1] = fake_ethertype_ipv6 (u16, network-byte-order) — unused, kept for compat
+ *   [2] = queue_count (u16, host order)
+ *   [3] = encap_ethertype (u16, host order) — e.g. 0x88B5
+ */
 struct {
     __uint(type, BPF_MAP_TYPE_ARRAY);
     __uint(max_entries, 4);
@@ -33,14 +41,8 @@ struct {
 #define STAT_REDIRECT   2
 #define STAT_NO_SOCK    3
 #define STAT_ARP_PASS   4
-#define STAT_ICMP_PASS      5
-#define STAT_WAN_PASS_NOISE 6
-#define IPPROTO_ICMP_VAL    1
-
-static __always_inline __u32 bswap32(__u32 x)
-{
-    return bpf_htonl(x);
-}
+#define STAT_ICMP_PASS  5
+#define IPPROTO_ICMP_VAL 1
 
 static __always_inline void inc_stat(__u32 idx)
 {
@@ -52,7 +54,7 @@ static __always_inline void inc_stat(__u32 idx)
 SEC("xdp")
 int xdp_wan_redirect_prog(struct xdp_md *ctx)
 {
-    void *data = (void *)(long)ctx->data;
+    void *data     = (void *)(long)ctx->data;
     void *data_end = (void *)(long)ctx->data_end;
 
     inc_stat(STAT_TOTAL);
@@ -64,18 +66,40 @@ int xdp_wan_redirect_prog(struct xdp_md *ctx)
     __u16 proto = eth->h_proto;
     void *nh    = (void *)(eth + 1);
 
-    /* VLAN tag: handle both 802.1Q (0x8100) and 802.1ad/QinQ outer (0x88a8). */
-    if (proto == __constant_htons(ETH_P_8021Q) || proto == __constant_htons(ETH_P_8021AD)) {
+    /* Strip up to 2 stacked VLAN tags (0x8100 / 0x88a8). */
+    for (int tags = 0; tags < 2; tags++) {
+        if (proto != __constant_htons(ETH_P_8021Q) &&
+            proto != __constant_htons(ETH_P_8021AD))
+            break;
         if ((__u8 *)nh + 4 > (__u8 *)data_end)
             return XDP_PASS;
-        __be16 *ipe = (__be16 *)((__u8 *)nh + 2);
-        proto       = *ipe;
-        nh          = (void *)((__u8 *)nh + 4);
+        proto = *(__be16 *)((__u8 *)nh + 2);
+        nh    = (__u8 *)nh + 4;
     }
 
     if (proto == __constant_htons(ETH_P_ARP)) {
         inc_stat(STAT_ARP_PASS);
         return XDP_PASS;
+    }
+
+    /* Load encap_ethertype and qcount from config map. */
+    __u32 k2 = 2, k3 = 3;
+    __u16 *qcountp = bpf_map_lookup_elem(&wan_config_map, &k2);
+    __u16 *etp     = bpf_map_lookup_elem(&wan_config_map, &k3);
+    __u32 queue_id = ctx->rx_queue_index;
+
+    /* Encapsulated NE frame: EtherType == encap_ethertype (e.g. 0x88B5).
+     * First 4 bytes after EtherType are the flow_id — use for queue steering. */
+    if (etp && *etp != 0 && proto == bpf_htons(*etp)) {
+        if ((__u8 *)nh + 4 <= (__u8 *)data_end) {
+            __u32 fid_net;
+            __builtin_memcpy(&fid_net, nh, sizeof(fid_net));
+            __u32 fid      = bpf_ntohl(fid_net);
+            __u16 qcount   = qcountp ? *qcountp : 0;
+            if (qcount)
+                queue_id = fid % (__u32)qcount;
+        }
+        goto redirect;
     }
 
     if (proto == __constant_htons(ETH_P_IP)) {
@@ -86,6 +110,7 @@ int xdp_wan_redirect_prog(struct xdp_md *ctx)
             inc_stat(STAT_ICMP_PASS);
             return XDP_PASS;
         }
+        /* For plain IPv4, steer by rx_queue_index (RSS already balanced). */
         goto redirect;
     }
 
@@ -100,55 +125,16 @@ int xdp_wan_redirect_prog(struct xdp_md *ctx)
         goto redirect;
     }
 
-    /* Encapsulated NE frames (outer EtherType = encap_ethertype) should be redirected too. */
-    __u32 k3_pre = 3;
-    __u16 *encap_etp = bpf_map_lookup_elem(&wan_config_map, &k3_pre);
-    if (encap_etp && *encap_etp != 0 && proto == bpf_htons(*encap_etp))
-        goto redirect;
-
-    __u32 key0 = 0, key1 = 1;
-    __u16 *fake4 = bpf_map_lookup_elem(&wan_config_map, &key0);
-    if (fake4 && *fake4 != 0 &&
-        (proto & __constant_htons(0xFF00)) == (*fake4 & __constant_htons(0xFF00)))
-        goto redirect;
-
-    __u16 *fake6 = bpf_map_lookup_elem(&wan_config_map, &key1);
-    if (fake6 && *fake6 != 0 &&
-        (proto & __constant_htons(0xFF00)) == (*fake6 & __constant_htons(0xFF00)))
-        goto redirect;
-
     inc_stat(STAT_NON_IP);
     return XDP_PASS;
 
 redirect:
     ;
-
-    /* Optional flow_id steering on encapsulated frames:
-     * wan_config_map[2] = qcount (u16)
-     * wan_config_map[3] = encap_ethertype (u16, host order)
-     */
-    __u32 k2 = 2, k3 = 3;
-    __u16 *qcountp = bpf_map_lookup_elem(&wan_config_map, &k2);
-    __u16 *etp     = bpf_map_lookup_elem(&wan_config_map, &k3);
-    __u32 queue_id = ctx->rx_queue_index;
-    if (etp && *etp != 0 && proto == bpf_htons(*etp)) {
-        if ((__u8 *)nh + 4 <= (__u8 *)data_end) {
-            __u32 fid_net;
-            __builtin_memcpy(&fid_net, nh, sizeof(fid_net));
-            __u32 fid = bswap32(fid_net);
-            __u16 qcount = qcountp ? *qcountp : 0;
-            if (qcount)
-                queue_id = (__u32)(fid % qcount);
-        }
-    }
     int ret = bpf_redirect_map(&wan_xsks_map, queue_id, XDP_PASS);
-
-    if (ret == XDP_REDIRECT) {
+    if (ret == XDP_REDIRECT)
         inc_stat(STAT_REDIRECT);
-    } else {
+    else
         inc_stat(STAT_NO_SOCK);
-    }
-
     return ret;
 }
 

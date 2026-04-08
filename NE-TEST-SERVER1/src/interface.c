@@ -304,7 +304,7 @@ int interface_init_local(struct xsk_interface *iface,
         .fill_size = local_cfg->ring_size,
         .comp_size = local_cfg->ring_size,
         .frame_size = local_cfg->frame_size,
-        .frame_headroom = 0,
+        .frame_headroom = 4,
         .flags = 0
     };
 
@@ -555,7 +555,7 @@ int interface_init_wan_rx(struct xsk_interface *iface,
         .fill_size = wan_cfg->ring_size,
         .comp_size = wan_cfg->ring_size,
         .frame_size = wan_cfg->frame_size,
-        .frame_headroom = 0,
+        .frame_headroom = 4,
         .flags = 0
     };
 

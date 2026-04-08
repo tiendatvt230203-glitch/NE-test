@@ -75,13 +75,14 @@ static uint64_t flow_id_from_5tuple(uint32_t src_ip, uint32_t dst_ip, uint16_t s
     return x;
 }
 
-static int wan_encap_inplace(struct forwarder *fwd, int wan_idx, uint8_t *pkt, uint32_t *pkt_len_io) {
+static int wan_encap_inplace(struct forwarder *fwd, int wan_idx, uint8_t *pkt,
+                             uint32_t *pkt_len_io) {
     if (!fwd || !pkt || !pkt_len_io || wan_idx < 0 || wan_idx >= fwd->wan_count)
         return -1;
     if (!fwd->cfg || !fwd->cfg->encap_enable || fwd->cfg->encap_ethertype == 0)
         return -1;
 
-    struct xsk_interface *wan = &fwd->wans[wan_idx];
+    struct xsk_interface *wan     = &fwd->wans[wan_idx];
     uint32_t              pkt_len = *pkt_len_io;
     if (pkt_len + (uint32_t)NE_WAN_ENCAP_LEN > (uint32_t)wan->frame_size)
         return -1;
@@ -110,35 +111,32 @@ static int wan_encap_inplace(struct forwarder *fwd, int wan_idx, uint8_t *pkt, u
     return 0;
 }
 
-static int wan_ne_encap_strip(const uint8_t *pkt, uint32_t len, uint16_t encap_et, uint32_t *strip_out,
-                              uint32_t *fid_off_out, uint32_t *inner_off_out) {
+/* Returns 0 and fills *strip_out with bytes to remove from front (DA+SA reused).
+ * Layout on wire: [outer DA(6)|outer SA(6)|encap_et(2)|fid(4)|inner DA(6)|inner SA(6)|...] */
+static int wan_ne_encap_strip(const uint8_t *pkt, uint32_t len, uint16_t encap_et,
+                               uint32_t *strip_out) {
     if (!pkt || encap_et == 0 || len < 14u)
         return -1;
-    /* Handle: plain encap, VLAN 802.1Q (0x8100), QinQ/802.1ad (0x88a8), and up to 2 stacked tags. */
-    uint32_t off = 14u;
+
+    uint32_t off = 14u; /* points past outer DA+SA */
     uint16_t et  = ((uint16_t)pkt[12] << 8) | pkt[13];
 
+    /* Skip up to 2 stacked VLAN tags (0x8100, 0x88a8). */
     for (int tags = 0; tags < 2; tags++) {
         if (et == encap_et) {
             uint32_t strip = off + NE_WAN_ENCAP_FID_LEN;
             if (len < strip + 14u)
                 return -1;
-            *strip_out     = strip;
-            *fid_off_out   = off;
-            *inner_off_out = strip;
+            *strip_out = strip;
             return 0;
         }
-
         if (et != 0x8100u && et != 0x88a8u)
             break;
-
-        if (len < off + 4u + 2u)
+        if (len < off + 4u)
             return -1;
-        /* VLAN tag: next EtherType sits at (off+2). */
         et  = ((uint16_t)pkt[off + 2] << 8) | pkt[off + 3];
         off += 4u;
     }
-
     return -1;
 }
 
@@ -146,14 +144,12 @@ static int wan_decap_inplace(struct forwarder *fwd, uint8_t *pkt, uint32_t *pkt_
     if (!fwd || !pkt || !pkt_len_w || !fwd->cfg)
         return -1;
     if (!fwd->cfg->encap_enable || fwd->cfg->encap_ethertype == 0)
-        return 1;
+        return 1; /* encap disabled — nothing to strip */
 
     uint32_t n = *pkt_len_w;
-    uint32_t strip, fid, inner;
-    (void)fid;
-    (void)inner;
-    if (wan_ne_encap_strip(pkt, n, fwd->cfg->encap_ethertype, &strip, &fid, &inner) != 0)
-        return 1;
+    uint32_t strip;
+    if (wan_ne_encap_strip(pkt, n, fwd->cfg->encap_ethertype, &strip) != 0)
+        return 1; /* not an encap frame — pass through */
 
     memmove(pkt, pkt + strip, n - strip);
     *pkt_len_w = n - strip;
@@ -364,6 +360,7 @@ static void *wan_queue_thread_no_crypto(void *arg) {
             uint8_t *pkt     = (uint8_t *)pkt_ptrs[i];
             uint32_t pkt_len = pkt_lens[i];
 
+            /* Strip encap header if present (returns 1 = no encap, 0 = stripped, -1 = error). */
             (void)wan_decap_inplace(fwd, pkt, &pkt_len);
 
             uint32_t dest_ip = get_dest_ip(pkt, pkt_len);
