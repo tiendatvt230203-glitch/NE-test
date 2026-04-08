@@ -46,6 +46,7 @@ static int l2_macs_nonzero(const uint8_t *dmac, const uint8_t *smac) {
     return d != 0 && s != 0;
 }
 
+/* IEEE 802.3: pkt[0..5]=ether_dhost, pkt[6..11]=ether_shost (frame do ta phát ra segment đó). */
 static int l2_rewrite_ether(uint8_t *pkt, const uint8_t *dmac, const uint8_t *smac) {
     if (!pkt || !l2_macs_nonzero(dmac, smac))
         return -1;
@@ -224,14 +225,14 @@ static void ne_wan_oneframe(char *buf, size_t cap, const uint8_t *p, uint32_t pl
         inet_ntop(AF_INET, &xa, a, sizeof a);
         inet_ntop(AF_INET, &xb, b, sizeof b);
         if (pr == IPPROTO_TCP)
-            snprintf(buf, cap, "%s>%s %s:%u->%s:%u tcp", dm, sm, a, sp, b, dp);
+            snprintf(buf, cap, "%s>%s %s:%u->%s:%u tcp", sm, dm, a, sp, b, dp);
         else if (pr == IPPROTO_UDP)
-            snprintf(buf, cap, "%s>%s %s:%u->%s:%u udp", dm, sm, a, sp, b, dp);
+            snprintf(buf, cap, "%s>%s %s:%u->%s:%u udp", sm, dm, a, sp, b, dp);
         else
-            snprintf(buf, cap, "%s>%s %s->%s proto=%u", dm, sm, a, b, pr);
+            snprintf(buf, cap, "%s>%s %s->%s proto=%u", sm, dm, a, b, pr);
     } else {
         uint16_t et = ((uint16_t)p[12] << 8) | p[13];
-        snprintf(buf, cap, "%s>%s et=0x%04x len=%u", dm, sm, et, plen);
+        snprintf(buf, cap, "%s>%s et=0x%04x len=%u", sm, dm, et, plen);
     }
 }
 
@@ -438,6 +439,7 @@ static void *wan_queue_thread_no_crypto(void *arg) {
                                                      : (tx_base % nq);
             }
 
+            /* WAN->local TX: dhost=peer LAN, shost=MAC iface local của ne-plain (trùng local_* cfg). */
             if (l2_rewrite_ether(pkt, local_cfg->dst_mac, local_cfg->src_mac) != 0) {
                 __sync_fetch_and_add(&fwd->total_dropped, 1);
                 continue;
