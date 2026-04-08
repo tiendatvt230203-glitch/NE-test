@@ -242,11 +242,46 @@ static void ne_wan_oneframe(char *buf, size_t cap, const uint8_t *p, uint32_t pl
     }
 }
 
-static void ne_wan_line_xsk_88b5(char *buf, size_t cap, const uint8_t *pkt, uint32_t len) {
+static int ne_wan_should_log_pkt(const uint8_t *pkt, uint32_t len, uint16_t want_et) {
+    if (!pkt)
+        return 0;
+    if (want_et == 0)
+        want_et = NE_WAN_LOG_ET;
+    if (len < 14)
+        return 0;
+    uint16_t et = ((uint16_t)pkt[12] << 8) | pkt[13];
+    if (et == want_et)
+        return len >= (uint32_t)NE_WAN_ENCAP_LEN + 14u;
+    if (et == 0x8100 && len >= 18) {
+        et = ((uint16_t)pkt[16] << 8) | pkt[17];
+        if (et == want_et)
+            return len >= 36u;
+    }
+    return 0;
+}
+
+static void ne_wan_line_xsk_pre(char *buf, size_t cap, const uint8_t *pkt, uint32_t len, uint16_t want_et) {
+    if (want_et == 0)
+        want_et = NE_WAN_LOG_ET;
+    uint32_t fid_off, inner_off;
+    uint16_t et = ((uint16_t)pkt[12] << 8) | pkt[13];
+    if (et == 0x8100 && len >= 22) {
+        fid_off  = 18;
+        inner_off = 22;
+        et       = ((uint16_t)pkt[16] << 8) | pkt[17];
+    } else {
+        fid_off   = 14;
+        inner_off = (uint32_t)NE_WAN_ENCAP_LEN;
+        et        = ((uint16_t)pkt[12] << 8) | pkt[13];
+    }
+    if (et != want_et || len < inner_off + 14 || len < fid_off + 4) {
+        snprintf(buf, cap, "short");
+        return;
+    }
     uint32_t fid_w;
-    memcpy(&fid_w, pkt + 14, 4);
+    memcpy(&fid_w, pkt + fid_off, 4);
     char inner[200];
-    ne_wan_oneframe(inner, sizeof inner, pkt + NE_WAN_ENCAP_LEN, len - (uint32_t)NE_WAN_ENCAP_LEN);
+    ne_wan_oneframe(inner, sizeof inner, pkt + inner_off, len - inner_off);
     snprintf(buf, cap, "len=%u fid=0x%08x %s", len, ntohl(fid_w), inner);
 }
 
@@ -406,10 +441,11 @@ static void *wan_queue_thread_no_crypto(void *arg) {
             uint32_t pkt_len = pkt_lens[i];
 
             char     wan_pre[384];
-            uint16_t et_wan = ((uint16_t)pkt[12] << 8) | pkt[13];
-            int wan_log = (et_wan == NE_WAN_LOG_ET && pkt_len >= (uint32_t)NE_WAN_ENCAP_LEN + 14u);
+            uint16_t want_et =
+                (fwd->cfg && fwd->cfg->encap_ethertype != 0) ? fwd->cfg->encap_ethertype : NE_WAN_LOG_ET;
+            int wan_log = ne_wan_should_log_pkt(pkt, pkt_len, want_et);
             if (wan_log)
-                ne_wan_line_xsk_88b5(wan_pre, sizeof wan_pre, pkt, pkt_len);
+                ne_wan_line_xsk_pre(wan_pre, sizeof wan_pre, pkt, pkt_len, want_et);
 
             (void)wan_decap_inplace(fwd, pkt, &pkt_len);
 
@@ -451,15 +487,16 @@ static void *wan_queue_thread_no_crypto(void *arg) {
                 continue;
             }
 
+            if (wan_log) {
+                char post[384];
+                ne_wan_oneframe(post, sizeof post, pkt, pkt_len);
+                fprintf(stderr, "[ne-plain] xsk: %s | to_local: %s\n", wan_pre, post);
+                (void)fflush(stderr);
+            }
+
             if (interface_send_to_local_batch_queue(local_iface, tq, local_cfg, pkt, pkt_len) == 0) {
                 __sync_fetch_and_add(&fwd->wan_to_local, 1);
                 local_used_queues[local_idx] |= (1u << tq);
-                if (wan_log) {
-                    char post[384];
-                    ne_wan_oneframe(post, sizeof post, pkt, pkt_len);
-                    fprintf(stderr, "[ne-plain] xsk: %s | to_local: %s\n", wan_pre, post);
-                    (void)fflush(stderr);
-                }
             } else
                 __sync_fetch_and_add(&fwd->total_dropped, 1);
         }
