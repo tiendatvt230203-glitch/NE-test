@@ -427,12 +427,24 @@ static void *wan_queue_thread_no_crypto(void *arg) {
             uint32_t dest_ip = get_dest_ip(pkt, pkt_len);
             if (dest_ip == 0) {
                 __sync_fetch_and_add(&fwd->total_dropped, 1);
+                flockfile(stderr);
+                (void)fprintf(stderr,
+                             "[ne-plain] wan_drop wan=%d q=%d len=%u reason=no_dest_ip\n",
+                             wan_idx, queue_idx, pkt_len);
+                (void)fflush(stderr);
+                funlockfile(stderr);
                 continue;
             }
 
             int local_idx = config_find_local_for_ip(fwd->cfg, dest_ip);
             if (local_idx < 0) {
                 __sync_fetch_and_add(&fwd->total_dropped, 1);
+                flockfile(stderr);
+                (void)fprintf(stderr,
+                             "[ne-plain] wan_drop wan=%d q=%d len=%u reason=no_local_subnet\n",
+                             wan_idx, queue_idx, pkt_len);
+                (void)fflush(stderr);
+                funlockfile(stderr);
                 continue;
             }
 
@@ -459,6 +471,12 @@ static void *wan_queue_thread_no_crypto(void *arg) {
             /* WAN->local TX: dhost=peer LAN, shost=MAC iface local của ne-plain (trùng local_* cfg). */
             if (l2_rewrite_ether(pkt, local_cfg->dst_mac, local_cfg->src_mac) != 0) {
                 __sync_fetch_and_add(&fwd->total_dropped, 1);
+                flockfile(stderr);
+                (void)fprintf(stderr,
+                             "[ne-plain] wan_drop wan=%d q=%d len=%u reason=l2_rewrite_bad_mac\n",
+                             wan_idx, queue_idx, pkt_len);
+                (void)fflush(stderr);
+                funlockfile(stderr);
                 continue;
             }
 
