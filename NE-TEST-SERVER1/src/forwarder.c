@@ -246,14 +246,14 @@ static void ne_wan_oneframe(char *buf, size_t cap, const uint8_t *p, uint32_t pl
         inet_ntop(AF_INET, &xa, a, sizeof a);
         inet_ntop(AF_INET, &xb, b, sizeof b);
         if (pr == IPPROTO_TCP)
-            snprintf(buf, cap, "%s>%s %s:%u->%s:%u tcp", dm, sm, a, sp, b, dp);
+            snprintf(buf, cap, "%s>%s %s:%u->%s:%u tcp", sm, dm, a, sp, b, dp);
         else if (pr == IPPROTO_UDP)
-            snprintf(buf, cap, "%s>%s %s:%u->%s:%u udp", dm, sm, a, sp, b, dp);
+            snprintf(buf, cap, "%s>%s %s:%u->%s:%u udp", sm, dm, a, sp, b, dp);
         else
-            snprintf(buf, cap, "%s>%s %s->%s proto=%u", dm, sm, a, b, pr);
+            snprintf(buf, cap, "%s>%s %s->%s proto=%u", sm, dm, a, b, pr);
     } else {
         uint16_t et = ((uint16_t)p[12] << 8) | p[13];
-        snprintf(buf, cap, "%s>%s et=0x%04x len=%u", dm, sm, et, plen);
+        snprintf(buf, cap, "%s>%s et=0x%04x len=%u", sm, dm, et, plen);
     }
 }
 
