@@ -228,6 +228,8 @@ static int parse_flow(void *pkt_data, uint32_t pkt_len, uint32_t *src_ip, uint32
     return 0;
 }
 
+#define NE_WAN_LOG_ET 0x88B5u
+
 static void ne_wan_oneframe(char *buf, size_t cap, const uint8_t *p, uint32_t plen) {
     if (!p || plen < 14) {
         snprintf(buf, cap, "short");
@@ -255,6 +257,14 @@ static void ne_wan_oneframe(char *buf, size_t cap, const uint8_t *p, uint32_t pl
         uint16_t et = ((uint16_t)p[12] << 8) | p[13];
         snprintf(buf, cap, "%s>%s et=0x%04x len=%u", sm, dm, et, plen);
     }
+}
+
+static void ne_wan_line_xsk_88b5(char *buf, size_t cap, const uint8_t *pkt, uint32_t len) {
+    uint32_t fid_w;
+    memcpy(&fid_w, pkt + 14, 4);
+    char inner[200];
+    ne_wan_oneframe(inner, sizeof inner, pkt + NE_WAN_ENCAP_LEN, len - (uint32_t)NE_WAN_ENCAP_LEN);
+    snprintf(buf, cap, "len=%u fid=0x%08x %s", len, ntohl(fid_w), inner);
 }
 
 static inline uint32_t flow_hash_local_tq(uint32_t src_ip, uint32_t dst_ip, uint16_t src_port,
@@ -412,39 +422,23 @@ static void *wan_queue_thread_no_crypto(void *arg) {
             uint8_t *pkt     = (uint8_t *)pkt_ptrs[i];
             uint32_t pkt_len = pkt_lens[i];
 
-            {
-                char rx_line[384];
-                ne_wan_oneframe(rx_line, sizeof rx_line, pkt, pkt_len);
-                flockfile(stderr);
-                (void)fprintf(stderr, "[ne-plain] wan_rx wan=%d q=%d len=%u %s\n", wan_idx, queue_idx,
-                             pkt_len, rx_line);
-                (void)fflush(stderr);
-                funlockfile(stderr);
-            }
+            char     wan_pre[384];
+            uint16_t et_wan = ((uint16_t)pkt[12] << 8) | pkt[13];
+            int wan_log = (et_wan == NE_WAN_LOG_ET && pkt_len >= (uint32_t)NE_WAN_ENCAP_LEN + 14u);
+            if (wan_log)
+                ne_wan_line_xsk_88b5(wan_pre, sizeof wan_pre, pkt, pkt_len);
 
             (void)wan_decap_inplace(fwd, pkt, &pkt_len);
 
             uint32_t dest_ip = get_dest_ip(pkt, pkt_len);
             if (dest_ip == 0) {
                 __sync_fetch_and_add(&fwd->total_dropped, 1);
-                flockfile(stderr);
-                (void)fprintf(stderr,
-                             "[ne-plain] wan_drop wan=%d q=%d len=%u reason=no_dest_ip\n",
-                             wan_idx, queue_idx, pkt_len);
-                (void)fflush(stderr);
-                funlockfile(stderr);
                 continue;
             }
 
             int local_idx = config_find_local_for_ip(fwd->cfg, dest_ip);
             if (local_idx < 0) {
                 __sync_fetch_and_add(&fwd->total_dropped, 1);
-                flockfile(stderr);
-                (void)fprintf(stderr,
-                             "[ne-plain] wan_drop wan=%d q=%d len=%u reason=no_local_subnet\n",
-                             wan_idx, queue_idx, pkt_len);
-                (void)fflush(stderr);
-                funlockfile(stderr);
                 continue;
             }
 
@@ -471,28 +465,20 @@ static void *wan_queue_thread_no_crypto(void *arg) {
             /* WAN->local TX: dhost=peer LAN, shost=MAC iface local của ne-plain (trùng local_* cfg). */
             if (l2_rewrite_ether(pkt, local_cfg->dst_mac, local_cfg->src_mac) != 0) {
                 __sync_fetch_and_add(&fwd->total_dropped, 1);
-                flockfile(stderr);
-                (void)fprintf(stderr,
-                             "[ne-plain] wan_drop wan=%d q=%d len=%u reason=l2_rewrite_bad_mac\n",
-                             wan_idx, queue_idx, pkt_len);
-                (void)fflush(stderr);
-                funlockfile(stderr);
                 continue;
-            }
-
-            {
-                char to_line[384];
-                ne_wan_oneframe(to_line, sizeof to_line, pkt, pkt_len);
-                flockfile(stderr);
-                (void)fprintf(stderr, "[ne-plain] wan_to_local wan=%d q=%d len=%u %s\n", wan_idx,
-                             queue_idx, pkt_len, to_line);
-                (void)fflush(stderr);
-                funlockfile(stderr);
             }
 
             if (interface_send_to_local_batch_queue(local_iface, tq, local_cfg, pkt, pkt_len) == 0) {
                 __sync_fetch_and_add(&fwd->wan_to_local, 1);
                 local_used_queues[local_idx] |= (1u << tq);
+                if (wan_log) {
+                    char post[384];
+                    ne_wan_oneframe(post, sizeof post, pkt, pkt_len);
+                    flockfile(stderr);
+                    (void)fprintf(stderr, "[ne-plain] xsk: %s | to_local: %s\n", wan_pre, post);
+                    (void)fflush(stderr);
+                    funlockfile(stderr);
+                }
             } else
                 __sync_fetch_and_add(&fwd->total_dropped, 1);
         }

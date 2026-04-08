@@ -3,6 +3,7 @@
 #include <linux/ip.h>
 #include <linux/in.h>
 #include <linux/ipv6.h>
+#include <linux/udp.h>
 #include <bpf/bpf_helpers.h>
 #include <bpf/bpf_endian.h>
 
@@ -32,8 +33,9 @@ struct {
 #define STAT_REDIRECT   2
 #define STAT_NO_SOCK    3
 #define STAT_ARP_PASS   4
-#define STAT_ICMP_PASS  5
-#define IPPROTO_ICMP_VAL 1
+#define STAT_ICMP_PASS      5
+#define STAT_WAN_PASS_NOISE 6
+#define IPPROTO_ICMP_VAL    1
 
 static __always_inline __u32 bswap32(__u32 x)
 {
@@ -59,6 +61,17 @@ int xdp_wan_redirect_prog(struct xdp_md *ctx)
     if ((void *)(eth + 1) > data_end)
         return XDP_PASS;
 
+    /* L2 broadcast / multicast: không kéo lên AF_XDP (NetBIOS, ARP-like noise trên WAN). */
+    if (eth->h_dest[0] == 0xff && eth->h_dest[1] == 0xff && eth->h_dest[2] == 0xff &&
+        eth->h_dest[3] == 0xff && eth->h_dest[4] == 0xff && eth->h_dest[5] == 0xff) {
+        inc_stat(STAT_WAN_PASS_NOISE);
+        return XDP_PASS;
+    }
+    if (eth->h_dest[0] & 0x01) {
+        inc_stat(STAT_WAN_PASS_NOISE);
+        return XDP_PASS;
+    }
+
     __u16 proto = eth->h_proto;
     void *nh    = (void *)(eth + 1);
 
@@ -82,6 +95,25 @@ int xdp_wan_redirect_prog(struct xdp_md *ctx)
         if (ip->protocol == IPPROTO_ICMP_VAL) {
             inc_stat(STAT_ICMP_PASS);
             return XDP_PASS;
+        }
+        if (ip->daddr == 0xffffffff) {
+            inc_stat(STAT_WAN_PASS_NOISE);
+            return XDP_PASS;
+        }
+        if (ip->protocol == IPPROTO_UDP) {
+            __u32 ihl = (__u32)ip->ihl * 4U;
+            if (ihl >= 20U) {
+                __u8 *udp_raw = (__u8 *)ip + ihl;
+                if (udp_raw + sizeof(struct udphdr) <= (__u8 *)data_end) {
+                    struct udphdr *udp = (struct udphdr *)udp_raw;
+                    __u16 dport      = bpf_ntohs(udp->dest);
+                    __u16 sport      = bpf_ntohs(udp->source);
+                    if (dport == 137 || dport == 138 || sport == 137 || sport == 138) {
+                        inc_stat(STAT_WAN_PASS_NOISE);
+                        return XDP_PASS;
+                    }
+                }
+            }
         }
         goto redirect;
     }
