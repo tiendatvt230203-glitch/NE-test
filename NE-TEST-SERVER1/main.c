@@ -19,12 +19,17 @@ static int ne_plain_libbpf_print(enum libbpf_print_level level, const char *fmt,
     va_end(aq);
     if (strstr(buf, "Retrying without BTF") != NULL)
         return 0;
-    return vfprintf(stderr, fmt, ap);
+    flockfile(stderr);
+    int n = vfprintf(stderr, fmt, ap);
+    funlockfile(stderr);
+    return n;
 }
 
 int main(int argc, char **argv) {
     libbpf_set_print(ne_plain_libbpf_print);
+    /* Unbuffered + flockfile in callback / forwarder avoids garbled lines from multi-queue threads. */
     (void)setvbuf(stderr, NULL, _IONBF, 0);
+    (void)setvbuf(stdout, NULL, _IONBF, 0);
 
     if (argc != 2) {
         fprintf(stderr, "usage: %s <config.cfg>\n", argv[0] ? argv[0] : "ne-plain");
