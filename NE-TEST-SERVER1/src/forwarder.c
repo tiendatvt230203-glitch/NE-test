@@ -119,39 +119,53 @@ static int wan_encap_inplace(struct forwarder *fwd, int wan_idx, uint8_t *pkt, u
     return 0;
 }
 
-static int wan_decap_inplace(struct forwarder *fwd, uint8_t *pkt, uint32_t *pkt_len_io) {
-    if (!fwd || !pkt || !pkt_len_io || !fwd->cfg)
+/*
+ * Khớp layout mà XDP nhìn thấy: VLAN không bị bỏ trong buffer — chỉ ethertype trong được đọc (bpf).
+ * Plain:   [eth 14][encap_et][fid 4][payload…]  → strip = NE_WAN_ENCAP_LEN
+ * 802.1Q:  [eth 14][8100+tci 4][encap_et][fid 4][payload…]  → strip = 22
+ */
+static int wan_ne_encap_strip(const uint8_t *pkt, uint32_t len, uint16_t encap_et, uint32_t *strip_out,
+                              uint32_t *fid_off_out, uint32_t *inner_off_out) {
+    if (!pkt || encap_et == 0 || len < 14u)
+        return -1;
+    uint16_t et = ((uint16_t)pkt[12] << 8) | pkt[13];
+    if (et == encap_et) {
+        uint32_t strip = (uint32_t)NE_WAN_ENCAP_LEN;
+        if (len < strip + 14u)
+            return -1;
+        *strip_out     = strip;
+        *fid_off_out   = 14;
+        *inner_off_out = strip;
+        return 0;
+    }
+    if (et == 0x8100u) {
+        if (len < 22u + 14u)
+            return -1;
+        if ((((uint16_t)pkt[16] << 8) | pkt[17]) != encap_et)
+            return -1;
+        *strip_out     = 22;
+        *fid_off_out   = 18;
+        *inner_off_out = 22;
+        return 0;
+    }
+    return -1;
+}
+
+static int wan_decap_inplace(struct forwarder *fwd, uint8_t *pkt, uint32_t *pkt_len_w) {
+    if (!fwd || !pkt || !pkt_len_w || !fwd->cfg)
         return -1;
     if (fwd->cfg->encap_ethertype == 0)
-        return 1; /* nothing to do */
-
-    uint32_t pkt_len = *pkt_len_io;
-    uint16_t encap_et = fwd->cfg->encap_ethertype;
-
-    if (pkt_len < 14u)
         return 1;
 
-    uint16_t et = ((uint16_t)pkt[12] << 8) | pkt[13];
-    uint32_t strip;
-
-    if (et == encap_et) {
-        if (pkt_len < (uint32_t)NE_WAN_ENCAP_LEN + (uint32_t)sizeof(struct ether_header))
-            return 1;
-        strip = (uint32_t)NE_WAN_ENCAP_LEN;
-    } else if (et == 0x8100u) {
-        /* 802.1Q: outer EtherType 0x8100, inner type @ 16–17, FID @ 18–21, inner frame @ 22+ */
-        if (pkt_len < 22u + (uint32_t)sizeof(struct ether_header))
-            return 1;
-        uint16_t et_in = ((uint16_t)pkt[16] << 8) | pkt[17];
-        if (et_in != encap_et)
-            return 1;
-        strip = 22u;
-    } else {
+    uint32_t n = *pkt_len_w;
+    uint32_t strip, fid, inner;
+    (void)fid;
+    (void)inner;
+    if (wan_ne_encap_strip(pkt, n, fwd->cfg->encap_ethertype, &strip, &fid, &inner) != 0)
         return 1;
-    }
 
-    memmove(pkt, pkt + strip, pkt_len - strip);
-    *pkt_len_io = pkt_len - strip;
+    memmove(pkt, pkt + strip, n - strip);
+    *pkt_len_w = n - strip;
     return 0;
 }
 
@@ -160,45 +174,23 @@ static void sigint_handler(int sig) {
     running = 0;
 }
 
-static int eth_ipv4_offset(const uint8_t *pkt, size_t pkt_len) {
-    if (!pkt || pkt_len < 14)
-        return -1;
-    uint16_t et = ((uint16_t)pkt[12] << 8) | pkt[13];
-    if (et == 0x0800)
-        return 14;
-    if (et == 0x8100) {
-        if (pkt_len < 18)
-            return -1;
-        et = ((uint16_t)pkt[16] << 8) | pkt[17];
-        if (et == 0x0800)
-            return 18;
-        if (et == 0x8100 && pkt_len >= 22) {
-            et = ((uint16_t)pkt[20] << 8) | pkt[21];
-            if (et == 0x0800)
-                return 22;
-        }
-    }
-    return -1;
-}
-
 static uint32_t get_dest_ip(void *pkt_data, uint32_t pkt_len) {
-    uint8_t *pkt = (uint8_t *)pkt_data;
-    int      l3  = eth_ipv4_offset(pkt, pkt_len);
-    if (l3 < 0)
+    if (pkt_len < sizeof(struct ether_header) + sizeof(struct iphdr))
         return 0;
-    if (pkt_len < (uint32_t)(l3 + 20))
+    struct ether_header *eth = (struct ether_header *)pkt_data;
+    if (ntohs(eth->ether_type) != ETHERTYPE_IP)
         return 0;
-    struct iphdr *ip = (struct iphdr *)(pkt + l3);
+    struct iphdr *ip = (struct iphdr *)(eth + 1);
     return ip->daddr;
 }
 
 static int parse_flow(void *pkt_data, uint32_t pkt_len, uint32_t *src_ip, uint32_t *dst_ip,
                       uint16_t *src_port, uint16_t *dst_port, uint8_t *protocol) {
     uint8_t *pkt = (uint8_t *)pkt_data;
-    int l3_off = eth_ipv4_offset(pkt, pkt_len);
-    if (l3_off < 0)
-        return -1;
+    const int l3_off = 14;
     if (pkt_len < (uint32_t)(l3_off + 20))
+        return -1;
+    if ((((uint16_t)pkt[12] << 8) | pkt[13]) != 0x0800u)
         return -1;
 
     struct iphdr *ip = (struct iphdr *)(pkt + l3_off);
@@ -228,8 +220,6 @@ static int parse_flow(void *pkt_data, uint32_t pkt_len, uint32_t *src_ip, uint32
     return 0;
 }
 
-#define NE_WAN_LOG_ET 0x88B5u
-
 static void ne_wan_oneframe(char *buf, size_t cap, const uint8_t *p, uint32_t plen) {
     if (!p || plen < 14) {
         snprintf(buf, cap, "short");
@@ -248,22 +238,27 @@ static void ne_wan_oneframe(char *buf, size_t cap, const uint8_t *p, uint32_t pl
         inet_ntop(AF_INET, &xa, a, sizeof a);
         inet_ntop(AF_INET, &xb, b, sizeof b);
         if (pr == IPPROTO_TCP)
-            snprintf(buf, cap, "%s>%s %s:%u->%s:%u tcp", sm, dm, a, sp, b, dp);
+            snprintf(buf, cap, "%s>%s %s:%u->%s:%u tcp", dm, sm, a, sp, b, dp);
         else if (pr == IPPROTO_UDP)
-            snprintf(buf, cap, "%s>%s %s:%u->%s:%u udp", sm, dm, a, sp, b, dp);
+            snprintf(buf, cap, "%s>%s %s:%u->%s:%u udp", dm, sm, a, sp, b, dp);
         else
-            snprintf(buf, cap, "%s>%s %s->%s proto=%u", sm, dm, a, b, pr);
+            snprintf(buf, cap, "%s>%s %s->%s proto=%u", dm, sm, a, b, pr);
     } else {
         uint16_t et = ((uint16_t)p[12] << 8) | p[13];
-        snprintf(buf, cap, "%s>%s et=0x%04x len=%u", sm, dm, et, plen);
+        snprintf(buf, cap, "%s>%s et=0x%04x len=%u", dm, sm, et, plen);
     }
 }
 
-static void ne_wan_line_xsk_88b5(char *buf, size_t cap, const uint8_t *pkt, uint32_t len) {
+static void ne_wan_line_xsk(char *buf, size_t cap, const uint8_t *pkt, uint32_t len, uint32_t fid_off,
+                            uint32_t inner_off) {
+    if (len < inner_off + 14u || fid_off + 4u > len) {
+        snprintf(buf, cap, "short");
+        return;
+    }
     uint32_t fid_w;
-    memcpy(&fid_w, pkt + 14, 4);
+    memcpy(&fid_w, pkt + fid_off, 4);
     char inner[200];
-    ne_wan_oneframe(inner, sizeof inner, pkt + NE_WAN_ENCAP_LEN, len - (uint32_t)NE_WAN_ENCAP_LEN);
+    ne_wan_oneframe(inner, sizeof inner, pkt + inner_off, len - inner_off);
     snprintf(buf, cap, "len=%u fid=0x%08x %s", len, ntohl(fid_w), inner);
 }
 
@@ -422,22 +417,57 @@ static void *wan_queue_thread_no_crypto(void *arg) {
             uint8_t *pkt     = (uint8_t *)pkt_ptrs[i];
             uint32_t pkt_len = pkt_lens[i];
 
-            char     wan_pre[384];
-            uint16_t et_wan = ((uint16_t)pkt[12] << 8) | pkt[13];
-            int wan_log = (et_wan == NE_WAN_LOG_ET && pkt_len >= (uint32_t)NE_WAN_ENCAP_LEN + 14u);
-            if (wan_log)
-                ne_wan_line_xsk_88b5(wan_pre, sizeof wan_pre, pkt, pkt_len);
+            {
+                uint16_t et12 = pkt_len >= 14 ? (((uint16_t)pkt[12] << 8) | pkt[13]) : 0;
+                fprintf(stderr,
+                        "[ne-plain] wan_rx wan_if=%d q=%d len=%u et12=0x%04x encap_cfg=0x%04x\n",
+                        wan_idx, queue_idx, pkt_len, et12,
+                        fwd->cfg ? fwd->cfg->encap_ethertype : 0);
+                if (et12 == 0x8100u && pkt_len >= 18)
+                    fprintf(stderr, "[ne-plain] wan_rx inner_et16=0x%04x\n",
+                            ((uint16_t)pkt[16] << 8) | pkt[17]);
+                fflush(stderr);
+            }
 
-            (void)wan_decap_inplace(fwd, pkt, &pkt_len);
+            char     wan_pre[384];
+            uint16_t encap_et = fwd->cfg ? fwd->cfg->encap_ethertype : 0;
+            uint32_t strip, fid_off, inner_off;
+            int      wan_log = 0;
+            if (encap_et != 0 &&
+                wan_ne_encap_strip(pkt, pkt_len, encap_et, &strip, &fid_off, &inner_off) == 0) {
+                wan_log = 1;
+                (void)strip;
+            }
+            if (wan_log)
+                ne_wan_line_xsk(wan_pre, sizeof wan_pre, pkt, pkt_len, fid_off, inner_off);
+            else {
+                uint16_t e = pkt_len >= 14 ? (((uint16_t)pkt[12] << 8) | pkt[13]) : 0;
+                snprintf(wan_pre, sizeof wan_pre, "no_ne_encap_layout len=%u et12=0x%04x", pkt_len, e);
+            }
+
+            int decap_rc = wan_decap_inplace(fwd, pkt, &pkt_len);
+            {
+                uint16_t a12 = pkt_len >= 14 ? (((uint16_t)pkt[12] << 8) | pkt[13]) : 0;
+                fprintf(stderr, "[ne-plain] wan_post_decap rc=%d len=%u et12=0x%04x\n", decap_rc, pkt_len,
+                        a12);
+                fflush(stderr);
+            }
 
             uint32_t dest_ip = get_dest_ip(pkt, pkt_len);
             if (dest_ip == 0) {
+                fprintf(stderr, "[ne-plain] wan_drop reason=no_dest_ip\n");
+                fflush(stderr);
                 __sync_fetch_and_add(&fwd->total_dropped, 1);
                 continue;
             }
 
             int local_idx = config_find_local_for_ip(fwd->cfg, dest_ip);
             if (local_idx < 0) {
+                char ipb[INET_ADDRSTRLEN];
+                struct in_addr dx = { .s_addr = dest_ip };
+                inet_ntop(AF_INET, &dx, ipb, sizeof ipb);
+                fprintf(stderr, "[ne-plain] wan_drop reason=no_local_subnet dest=%s\n", ipb);
+                fflush(stderr);
                 __sync_fetch_and_add(&fwd->total_dropped, 1);
                 continue;
             }
@@ -464,23 +494,31 @@ static void *wan_queue_thread_no_crypto(void *arg) {
 
             /* WAN->local TX: dhost=peer LAN, shost=MAC iface local của ne-plain (trùng local_* cfg). */
             if (l2_rewrite_ether(pkt, local_cfg->dst_mac, local_cfg->src_mac) != 0) {
+                fprintf(stderr, "[ne-plain] wan_drop reason=l2_rewrite_bad_mac\n");
+                fflush(stderr);
                 __sync_fetch_and_add(&fwd->total_dropped, 1);
                 continue;
+            }
+
+            {
+                char post[384];
+                ne_wan_oneframe(post, sizeof post, pkt, pkt_len);
+                fprintf(stderr, "[ne-plain] xsk: %s | to_local: %s\n", wan_pre, post);
+                fflush(stderr);
             }
 
             if (interface_send_to_local_batch_queue(local_iface, tq, local_cfg, pkt, pkt_len) == 0) {
                 __sync_fetch_and_add(&fwd->wan_to_local, 1);
                 local_used_queues[local_idx] |= (1u << tq);
-                if (wan_log) {
-                    char post[384];
-                    ne_wan_oneframe(post, sizeof post, pkt, pkt_len);
-                    flockfile(stderr);
-                    (void)fprintf(stderr, "[ne-plain] xsk: %s | to_local: %s\n", wan_pre, post);
-                    (void)fflush(stderr);
-                    funlockfile(stderr);
-                }
-            } else
+                fprintf(stderr, "[ne-plain] wan_tx_ok local_idx=%d tq=%d len=%u\n", local_idx, tq,
+                        pkt_len);
+                fflush(stderr);
+            } else {
+                fprintf(stderr, "[ne-plain] wan_drop reason=tx_local_fail local_idx=%d tq=%d len=%u\n",
+                        local_idx, tq, pkt_len);
+                fflush(stderr);
                 __sync_fetch_and_add(&fwd->total_dropped, 1);
+            }
         }
 
         for (int l = 0; l < fwd->local_count; l++) {
