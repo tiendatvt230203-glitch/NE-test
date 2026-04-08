@@ -225,57 +225,22 @@ static void ne_wan_oneframe(char *buf, size_t cap, const uint8_t *p, uint32_t pl
         inet_ntop(AF_INET, &xa, a, sizeof a);
         inet_ntop(AF_INET, &xb, b, sizeof b);
         if (pr == IPPROTO_TCP)
-            snprintf(buf, cap, "%s>%s %s:%u->%s:%u tcp", sm, dm, a, sp, b, dp);
+            snprintf(buf, cap, "src=%s dst=%s %s:%u->%s:%u tcp", sm, dm, a, sp, b, dp);
         else if (pr == IPPROTO_UDP)
-            snprintf(buf, cap, "%s>%s %s:%u->%s:%u udp", sm, dm, a, sp, b, dp);
+            snprintf(buf, cap, "src=%s dst=%s %s:%u->%s:%u udp", sm, dm, a, sp, b, dp);
         else
-            snprintf(buf, cap, "%s>%s %s->%s proto=%u", sm, dm, a, b, pr);
+            snprintf(buf, cap, "src=%s dst=%s %s->%s proto=%u", sm, dm, a, b, pr);
     } else {
         uint16_t et = ((uint16_t)p[12] << 8) | p[13];
-        snprintf(buf, cap, "%s>%s et=0x%04x len=%u", sm, dm, et, plen);
+        snprintf(buf, cap, "src=%s dst=%s et=0x%04x len=%u", sm, dm, et, plen);
     }
 }
 
-static int ne_wan_should_log_pkt(const uint8_t *pkt, uint32_t len, uint16_t want_et) {
-    if (!pkt)
-        return 0;
-    if (want_et == 0)
-        want_et = NE_WAN_LOG_ET;
-    if (len < 14)
-        return 0;
-    uint16_t et = ((uint16_t)pkt[12] << 8) | pkt[13];
-    if (et == want_et)
-        return len >= (uint32_t)NE_WAN_ENCAP_LEN + 14u;
-    if (et == 0x8100 && len >= 18) {
-        et = ((uint16_t)pkt[16] << 8) | pkt[17];
-        if (et == want_et)
-            return len >= 36u;
-    }
-    return 0;
-}
-
-static void ne_wan_line_xsk_pre(char *buf, size_t cap, const uint8_t *pkt, uint32_t len, uint16_t want_et) {
-    if (want_et == 0)
-        want_et = NE_WAN_LOG_ET;
-    uint32_t fid_off, inner_off;
-    uint16_t et = ((uint16_t)pkt[12] << 8) | pkt[13];
-    if (et == 0x8100 && len >= 22) {
-        fid_off   = 18;
-        inner_off = 22;
-        et        = ((uint16_t)pkt[16] << 8) | pkt[17];
-    } else {
-        fid_off   = 14;
-        inner_off = (uint32_t)NE_WAN_ENCAP_LEN;
-        et        = ((uint16_t)pkt[12] << 8) | pkt[13];
-    }
-    if (et != want_et || len < inner_off + 14 || len < fid_off + 4) {
-        snprintf(buf, cap, "short");
-        return;
-    }
+static void ne_wan_line_xsk_88b5(char *buf, size_t cap, const uint8_t *pkt, uint32_t len) {
     uint32_t fid_w;
-    memcpy(&fid_w, pkt + fid_off, 4);
+    memcpy(&fid_w, pkt + 14, 4);
     char inner[200];
-    ne_wan_oneframe(inner, sizeof inner, pkt + inner_off, len - inner_off);
+    ne_wan_oneframe(inner, sizeof inner, pkt + NE_WAN_ENCAP_LEN, len - (uint32_t)NE_WAN_ENCAP_LEN);
     snprintf(buf, cap, "len=%u fid=0x%08x %s", len, ntohl(fid_w), inner);
 }
 
@@ -435,11 +400,10 @@ static void *wan_queue_thread_no_crypto(void *arg) {
             uint32_t pkt_len = pkt_lens[i];
 
             char     wan_pre[384];
-            uint16_t want_et =
-                (fwd->cfg && fwd->cfg->encap_ethertype != 0) ? fwd->cfg->encap_ethertype : NE_WAN_LOG_ET;
-            int wan_log = ne_wan_should_log_pkt(pkt, pkt_len, want_et);
+            uint16_t et_wan = ((uint16_t)pkt[12] << 8) | pkt[13];
+            int wan_log = (et_wan == NE_WAN_LOG_ET && pkt_len >= (uint32_t)NE_WAN_ENCAP_LEN + 14u);
             if (wan_log)
-                ne_wan_line_xsk_pre(wan_pre, sizeof wan_pre, pkt, pkt_len, want_et);
+                ne_wan_line_xsk_88b5(wan_pre, sizeof wan_pre, pkt, pkt_len);
 
             (void)wan_decap_inplace(fwd, pkt, &pkt_len);
 
