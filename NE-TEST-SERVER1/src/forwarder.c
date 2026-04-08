@@ -59,19 +59,13 @@ static int set_wan_l2_addrs(struct forwarder *fwd, int wan_idx, uint8_t *pkt) {
     return l2_rewrite_ether(pkt, w->dst_mac, w->src_mac);
 }
 
-/* WAN encapsulation:
- *   outer: dst/src MAC for WAN, EtherType=encap_ethertype
- *   payload: flow_id (8 bytes, big endian) + inner Ethernet frame (original)
- *
- * This keeps only L2 cleartext on the WAN link. On WAN RX we decap before
- * forwarding down to local so local/client never sees the custom EtherType.
- */
+
 #define NE_WAN_ENCAP_FID_LEN 4
 #define NE_WAN_ENCAP_LEN (sizeof(struct ether_header) + NE_WAN_ENCAP_FID_LEN)
 
 static uint64_t flow_id_from_5tuple(uint32_t src_ip, uint32_t dst_ip, uint16_t src_port,
                                    uint16_t dst_port, uint8_t protocol) {
-    /* Deterministic 64-bit mix; caller controls uniqueness by how it chooses inputs. */
+
     uint64_t x = ((uint64_t)src_ip << 32) ^ (uint64_t)dst_ip;
     x ^= ((uint64_t)src_port << 48) ^ ((uint64_t)dst_port << 32) ^ (uint64_t)protocol;
     x ^= x >> 33;
@@ -106,18 +100,18 @@ static int wan_encap_inplace(struct forwarder *fwd, int wan_idx, uint8_t *pkt, u
     if (parse_flow(pkt, pkt_len, &src_ip, &dst_ip, &src_port, &dst_port, &proto) == 0)
         fid = flow_id_from_5tuple(src_ip, dst_ip, src_port, dst_port, proto);
     else
-        fid = (uint64_t)pkt_len; /* fallback, keeps it deterministic but not flow-sticky */
+        fid = (uint64_t)pkt_len; 
 
-    /* Shift inner frame right to make room for outer header+flow_id. */
+
     memmove(pkt + NE_WAN_ENCAP_LEN, pkt, pkt_len);
 
-    /* Outer Ethernet. */
+
     struct ether_header *eth = (struct ether_header *)pkt;
     memcpy(eth->ether_dhost, wan->dst_mac, MAC_LEN);
     memcpy(eth->ether_shost, wan->src_mac, MAC_LEN);
     eth->ether_type = htons(fwd->cfg->encap_ethertype);
 
-    /* flow_id (u32) in big-endian */
+
     uint32_t fid32 = (uint32_t)(fid & 0xffffffffu);
     uint32_t fid_be = bswap32_u32(fid32);
     memcpy(pkt + sizeof(*eth), &fid_be, sizeof(fid_be));
@@ -140,7 +134,7 @@ static int wan_decap_inplace(struct forwarder *fwd, uint8_t *pkt, uint32_t *pkt_
     if (ntohs(eth->ether_type) != fwd->cfg->encap_ethertype)
         return 1;
 
-    /* Strip outer eth + flow_id, shift inner frame back. */
+
     memmove(pkt, pkt + NE_WAN_ENCAP_LEN, pkt_len - (uint32_t)NE_WAN_ENCAP_LEN);
     *pkt_len_io = pkt_len - (uint32_t)NE_WAN_ENCAP_LEN;
     return 0;
@@ -528,7 +522,7 @@ int forwarder_init(struct forwarder *fwd, struct app_config *cfg) {
     fwd->cfg = cfg;
     interface_reset_redirect_maps();
 
-    /* queue_count is configured in config_file.c (or defaults) */
+
 
     uint32_t wan_window_sizes[MAX_INTERFACES] = {0};
     for (int i = 0; i < cfg->wan_count && i < MAX_INTERFACES; i++)

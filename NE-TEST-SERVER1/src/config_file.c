@@ -195,7 +195,7 @@ int config_load_file(const char *path, struct app_config *cfg) {
         if (W->ring_size == 0)
             W->ring_size = DEFAULT_RING_SIZE;
         if (W->window_size == 0)
-            W->window_size = 2048u * 1024u;
+            W->window_size = 131072u * 1024u; /* default 131072 KiB = 128 MiB per WAN window */
         if (W->queue_count <= 0)
             W->queue_count = DEFAULT_QUEUE_COUNT;
         W->encap_ethertype = cfg->encap_ethertype;

@@ -139,19 +139,26 @@ int flow_table_get_wan(struct flow_table *ft,
             entry->key.dst_ip == dst_ip) {
 
             entry->last_seen = now;
-            entry->byte_count += pkt_len;
 
             uint32_t cur_limit = 0;
             if (entry->current_wan >= 0 && entry->current_wan < ft->wan_count)
                 cur_limit = ft->wan_window_sizes[entry->current_wan];
 
-
-            if (cur_limit > 0 && entry->byte_count >= cur_limit) {
-                entry->byte_count = 0;
-                entry->current_wan = (entry->current_wan + 1) % ft->wan_count;
+            /* Sticky-within-window: the packet that reaches the limit still goes on the
+             * current WAN. Switch applies to the next packet/window. */
+            if (cur_limit > 0) {
+                uint32_t new_count = entry->byte_count + pkt_len;
+                wan_idx = entry->current_wan;
+                if (new_count >= cur_limit) {
+                    entry->byte_count = 0;
+                    entry->current_wan = (entry->current_wan + 1) % ft->wan_count;
+                } else {
+                    entry->byte_count = new_count;
+                }
+            } else {
+                entry->byte_count += pkt_len;
+                wan_idx = entry->current_wan;
             }
-
-            wan_idx = entry->current_wan;
             pthread_mutex_unlock(&ft->locks[idx]);
             return wan_idx;
         }
@@ -256,27 +263,32 @@ int flow_table_get_wan_profile(struct flow_table *ft,
             }
 
             entry->last_seen = now;
-            entry->byte_count += pkt_len;
 
             uint32_t cur_limit = 0;
             if (entry->current_wan >= 0 && entry->current_wan < ft->wan_count)
                 cur_limit = ft->wan_window_sizes[entry->current_wan];
 
             int sumw = weights_sum_positive(allowed_weights, allowed_count);
-            if (cur_limit > 0 && entry->byte_count >= cur_limit) {
-                entry->byte_count = 0;
-                if (sumw > 0 && allowed_weights) {
-                    entry->wrr_slot = (entry->wrr_slot + 1) % sumw;
-                    entry->current_wan = wrr_slot_to_wan(entry->wrr_slot, allowed_wans, allowed_weights,
-                                                         allowed_count, sumw);
-                } else {
-                    pos = wan_allowed_pos(entry->current_wan, allowed_wans, allowed_count);
-                    if (pos < 0) pos = 0;
-                    entry->current_wan = allowed_wans[(pos + 1) % allowed_count];
-                }
-            }
-
             int wan_idx = entry->current_wan;
+            if (cur_limit > 0) {
+                uint32_t new_count = entry->byte_count + pkt_len;
+                if (new_count >= cur_limit) {
+                    entry->byte_count = 0;
+                    if (sumw > 0 && allowed_weights) {
+                        entry->wrr_slot = (entry->wrr_slot + 1) % sumw;
+                        entry->current_wan = wrr_slot_to_wan(entry->wrr_slot, allowed_wans, allowed_weights,
+                                                             allowed_count, sumw);
+                    } else {
+                        pos = wan_allowed_pos(entry->current_wan, allowed_wans, allowed_count);
+                        if (pos < 0) pos = 0;
+                        entry->current_wan = allowed_wans[(pos + 1) % allowed_count];
+                    }
+                } else {
+                    entry->byte_count = new_count;
+                }
+            } else {
+                entry->byte_count += pkt_len;
+            }
             pthread_mutex_unlock(&ft->locks[idx]);
             return wan_idx;
         }
@@ -352,6 +364,7 @@ void flow_table_add_bytes(struct flow_table *ft,
                             cur_limit = ft->wan_window_sizes[entry->current_wan];
 
                         if (cur_limit > 0 && entry->byte_count >= cur_limit) {
+                            /* Apply switch to subsequent packets; keep boundary behavior consistent. */
                             entry->byte_count = 0;
                             entry->current_wan = (entry->current_wan + 1) % ft->wan_count;
                         }
@@ -384,6 +397,7 @@ void flow_table_add_bytes(struct flow_table *ft,
                     cur_limit = ft->wan_window_sizes[entry->current_wan];
 
                 if (cur_limit > 0 && entry->byte_count >= cur_limit) {
+                    /* Apply switch to subsequent packets; keep boundary behavior consistent. */
                     entry->byte_count = 0;
                     entry->current_wan = (entry->current_wan + 1) % ft->wan_count;
                 }
