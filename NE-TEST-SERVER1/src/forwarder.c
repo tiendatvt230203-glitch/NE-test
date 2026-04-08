@@ -7,9 +7,13 @@
 #include <string.h>
 #include <unistd.h>
 
+#include <netinet/ip.h>
+#include <netinet/tcp.h>
+#include <netinet/udp.h>
+
 #include "../inc/config.h"
 
-/* 14 byte eth (encap type + fid) + 4 byte fid = 18 byte gỡ khỏi đầu buffer sau khi nhận từ wan xdp */
+/* 14 byte eth + 4 byte fid (header NE trên WAN trước khi gỡ) */
 #define NE_STRIP_HEAD 18
 
 static volatile int running = 1;
@@ -19,16 +23,74 @@ static void sigint_handler(int sig) {
     running = 0;
 }
 
-/* (1) Nhận batch từ WAN — gọi qua interface_recv_single_queue ở thread. */
-/* (2) Gỡ NE_STRIP_HEAD byte + ghi MAC local0 (dst_mac src_mac) + in terminal. */
+static void mac_fmt(char *buf, size_t cap, const uint8_t *m) {
+    snprintf(buf, cap, "%02x:%02x:%02x:%02x:%02x:%02x", m[0], m[1], m[2], m[3], m[4], m[5]);
+}
+
+/* In IPv4 từ saddr/daddr (network endian), không dùng inet_ntop / arpa — không liên quan ARP L2. */
+static void ipv4_be_fmt(char *buf, size_t cap, uint32_t addr_be32) {
+    const uint8_t *b = (const uint8_t *)&addr_be32;
+    snprintf(buf, cap, "%u.%u.%u.%u", b[0], b[1], b[2], b[3]);
+}
+
+static void ip_l4_print(FILE *o, const uint8_t *p, uint32_t len, int ip_off) {
+    if (len < (uint32_t)ip_off + 20u)
+        return;
+    const struct iphdr *ip = (const struct iphdr *)(p + ip_off);
+    int ihl = ip->ihl * 4;
+    if (ihl < 20 || len < (uint32_t)ip_off + (uint32_t)ihl)
+        return;
+    char sa[24], da[24];
+    ipv4_be_fmt(sa, sizeof sa, ip->saddr);
+    ipv4_be_fmt(da, sizeof da, ip->daddr);
+    fprintf(o, " | %s->%s proto=%u", sa, da, ip->protocol);
+    if (ip->protocol == IPPROTO_TCP && len >= (uint32_t)ip_off + (uint32_t)ihl + 20u) {
+        const struct tcphdr *tcp =
+            (const struct tcphdr *)((const uint8_t *)ip + (unsigned)ihl);
+        fprintf(o, " tcp %u->%u", ntohs(tcp->source), ntohs(tcp->dest));
+    } else if (ip->protocol == IPPROTO_UDP && len >= (uint32_t)ip_off + (uint32_t)ihl + 8u) {
+        const struct udphdr *udp =
+            (const struct udphdr *)((const uint8_t *)ip + (unsigned)ihl);
+        fprintf(o, " udp %u->%u", ntohs(udp->source), ntohs(udp->dest));
+    }
+}
+
+/* In 1 dòng: MAC, ethertype, IPv4+L4 nếu đoán được offset (xsk wan vừa đẩy lên). */
+static void log_wan_frame(const char *tag, const uint8_t *pkt, uint32_t len, uint16_t encap_et) {
+    if (len < 14u) {
+        fprintf(stderr, "[ne-plain] %s len=%u (short)\n", tag, len);
+        fflush(stderr);
+        return;
+    }
+    char dm[24], sm[24];
+    mac_fmt(dm, sizeof dm, pkt);
+    mac_fmt(sm, sizeof sm, pkt + 6);
+    uint16_t et = ((uint16_t)pkt[12] << 8) | pkt[13];
+    fprintf(stderr, "[ne-plain] %s len=%u %s>%s et=0x%04x", tag, len, dm, sm, et);
+
+    if (et == 0x0800u)
+        ip_l4_print(stderr, pkt, len, 14);
+    else if (encap_et != 0u && et == encap_et && len >= 32u + 20u)
+        ip_l4_print(stderr, pkt, len, 32); /* inner eth14 + ip @32 */
+    else if (et == 0x8100u && len >= 50u && encap_et != 0u &&
+             ((((uint16_t)pkt[16] << 8) | pkt[17]) == encap_et) && len >= 36u + 20u)
+        ip_l4_print(stderr, pkt, len, 36); /* vlan+encap: IP thường @36 */
+
+    fprintf(stderr, "\n");
+    fflush(stderr);
+}
+
+/* Sau XSK: gỡ header + gán MAC local0 + in trước/sau. */
 static void wan_strip_mac_print(uint8_t *pkt, uint32_t len, const uint8_t *dst_mac,
-                                const uint8_t *src_mac) {
+                                const uint8_t *src_mac, uint16_t encap_et) {
+    log_wan_frame("wan_xsk_rx", pkt, len, encap_et);
+
     memmove(pkt, pkt + NE_STRIP_HEAD, (size_t)(len - NE_STRIP_HEAD));
     len -= NE_STRIP_HEAD;
     memcpy(pkt, dst_mac, 6);
     memcpy(pkt + 6, src_mac, 6);
-    fprintf(stderr, "[ne-plain] len=%u\n", len);
-    fflush(stderr);
+
+    log_wan_frame("wan_strip_rewrite", pkt, len, 0);
 }
 
 struct wq_arg {
@@ -54,7 +116,8 @@ static void *wan_worker(void *a) {
         if (n <= 0)
             continue;
         for (int i = 0; i < n; i++)
-            wan_strip_mac_print((uint8_t *)pkt_ptrs[i], pkt_lens[i], dm, sm);
+            wan_strip_mac_print((uint8_t *)pkt_ptrs[i], pkt_lens[i], dm, sm,
+                                f->cfg->encap_ethertype);
         interface_recv_release_single_queue(wan, q, addrs, n);
     }
     return NULL;
