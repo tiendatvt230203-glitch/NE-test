@@ -5,31 +5,18 @@
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
-#include <string.h>
 #include <pthread.h>
 #include <sched.h>
 
-static int ne_plain_libbpf_print(enum libbpf_print_level level, const char *fmt, va_list ap) {
-    if (level == LIBBPF_DEBUG)
-        return 0;
-    va_list aq;
-    va_copy(aq, ap);
-    char buf[768];
-    vsnprintf(buf, sizeof buf, fmt, aq);
-    va_end(aq);
-    if (strstr(buf, "Retrying without BTF") != NULL)
-        return 0;
-    flockfile(stderr);
-    int n = vfprintf(stderr, fmt, ap);
-    funlockfile(stderr);
-    return n;
+static int libbpf_silent(enum libbpf_print_level level, const char *fmt, va_list ap) {
+    (void)level;
+    (void)fmt;
+    (void)ap;
+    return 0;
 }
 
 int main(int argc, char **argv) {
-    libbpf_set_print(ne_plain_libbpf_print);
-    /* Unbuffered + flockfile in callback / forwarder avoids garbled lines from multi-queue threads. */
-    (void)setvbuf(stderr, NULL, _IONBF, 0);
-    (void)setvbuf(stdout, NULL, _IONBF, 0);
+    libbpf_set_print(libbpf_silent);
 
     if (argc != 2) {
         fprintf(stderr, "usage: %s <config.cfg>\n", argv[0] ? argv[0] : "ne-plain");
@@ -50,14 +37,11 @@ int main(int argc, char **argv) {
         return EXIT_FAILURE;
 
     struct cpu_policy_state cpu_st;
-    if (cpu_policy_apply(&cfg, &cpu_st) != 0) {
-        fprintf(stderr, "[cpu-policy] apply failed\n");
+    if (cpu_policy_apply(&cfg, &cpu_st) != 0)
         return EXIT_FAILURE;
-    }
 
     struct forwarder fwd;
-    if (forwarder_init(&fwd, &cfg) != 0)
-    {
+    if (forwarder_init(&fwd, &cfg) != 0) {
         (void)cpu_policy_restore(&cpu_st);
         return EXIT_FAILURE;
     }
