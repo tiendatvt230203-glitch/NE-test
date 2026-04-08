@@ -223,22 +223,6 @@ static int parse_flow(void *pkt_data, uint32_t pkt_len, uint32_t *src_ip, uint32
     return 0;
 }
 
-#define NE_WAN_LOG_ET 0x88B5u
-
-static int wan_rx_encap_for_log(const uint8_t *pkt, uint32_t pkt_len, uint16_t want_et) {
-    if (!pkt || pkt_len < 14u)
-        return 0;
-    uint16_t et = ((uint16_t)pkt[12] << 8) | pkt[13];
-    if (et == want_et)
-        return pkt_len >= (uint32_t)NE_WAN_ENCAP_LEN + 14u;
-    if (et == 0x8100u && pkt_len >= 22u) {
-        et = ((uint16_t)pkt[16] << 8) | pkt[17];
-        if (et == want_et)
-            return pkt_len >= 36u;
-    }
-    return 0;
-}
-
 static void ne_wan_oneframe(char *buf, size_t cap, const uint8_t *p, uint32_t plen) {
     if (!p || plen < 14) {
         snprintf(buf, cap, "short");
@@ -257,45 +241,15 @@ static void ne_wan_oneframe(char *buf, size_t cap, const uint8_t *p, uint32_t pl
         inet_ntop(AF_INET, &xa, a, sizeof a);
         inet_ntop(AF_INET, &xb, b, sizeof b);
         if (pr == IPPROTO_TCP)
-            snprintf(buf, cap, "src=%s dst=%s %s:%u->%s:%u tcp", sm, dm, a, sp, b, dp);
+            snprintf(buf, cap, "%s>%s %s:%u->%s:%u tcp", dm, sm, a, sp, b, dp);
         else if (pr == IPPROTO_UDP)
-            snprintf(buf, cap, "src=%s dst=%s %s:%u->%s:%u udp", sm, dm, a, sp, b, dp);
+            snprintf(buf, cap, "%s>%s %s:%u->%s:%u udp", dm, sm, a, sp, b, dp);
         else
-            snprintf(buf, cap, "src=%s dst=%s %s->%s proto=%u", sm, dm, a, b, pr);
+            snprintf(buf, cap, "%s>%s %s->%s proto=%u", dm, sm, a, b, pr);
     } else {
         uint16_t et = ((uint16_t)p[12] << 8) | p[13];
-        snprintf(buf, cap, "src=%s dst=%s et=0x%04x len=%u", sm, dm, et, plen);
+        snprintf(buf, cap, "%s>%s et=0x%04x len=%u", dm, sm, et, plen);
     }
-}
-
-static void ne_wan_line_xsk_encap(char *buf, size_t cap, const uint8_t *pkt, uint32_t len,
-                                  uint16_t want_et) {
-    uint32_t fid_off, inner_off;
-    uint16_t et = ((uint16_t)pkt[12] << 8) | pkt[13];
-    if (et == want_et) {
-        fid_off   = 14;
-        inner_off = (uint32_t)NE_WAN_ENCAP_LEN;
-    } else if (et == 0x8100u && len >= 22) {
-        uint16_t et_in = ((uint16_t)pkt[16] << 8) | pkt[17];
-        if (et_in != want_et) {
-            snprintf(buf, cap, "short");
-            return;
-        }
-        fid_off   = 18;
-        inner_off = 22;
-    } else {
-        snprintf(buf, cap, "short");
-        return;
-    }
-    if (len < inner_off + 14u || len < fid_off + 4u) {
-        snprintf(buf, cap, "short");
-        return;
-    }
-    uint32_t fid_w;
-    memcpy(&fid_w, pkt + fid_off, 4);
-    char inner[200];
-    ne_wan_oneframe(inner, sizeof inner, pkt + inner_off, len - inner_off);
-    snprintf(buf, cap, "len=%u fid=0x%08x %s", len, ntohl(fid_w), inner);
 }
 
 static inline uint32_t flow_hash_local_tq(uint32_t src_ip, uint32_t dst_ip, uint16_t src_port,
@@ -453,12 +407,15 @@ static void *wan_queue_thread_no_crypto(void *arg) {
             uint8_t *pkt     = (uint8_t *)pkt_ptrs[i];
             uint32_t pkt_len = pkt_lens[i];
 
-            char     wan_pre[384];
-            uint16_t want_et = (fwd->cfg && fwd->cfg->encap_ethertype != 0) ? fwd->cfg->encap_ethertype
-                                                                            : NE_WAN_LOG_ET;
-            int wan_log = wan_rx_encap_for_log(pkt, pkt_len, want_et);
-            if (wan_log)
-                ne_wan_line_xsk_encap(wan_pre, sizeof wan_pre, pkt, pkt_len, want_et);
+            {
+                char rx_line[384];
+                ne_wan_oneframe(rx_line, sizeof rx_line, pkt, pkt_len);
+                flockfile(stderr);
+                (void)fprintf(stderr, "[ne-plain] wan_rx wan=%d q=%d len=%u %s\n", wan_idx, queue_idx,
+                             pkt_len, rx_line);
+                (void)fflush(stderr);
+                funlockfile(stderr);
+            }
 
             (void)wan_decap_inplace(fwd, pkt, &pkt_len);
 
@@ -500,11 +457,12 @@ static void *wan_queue_thread_no_crypto(void *arg) {
                 continue;
             }
 
-            if (wan_log) {
-                char post[384];
-                ne_wan_oneframe(post, sizeof post, pkt, pkt_len);
+            {
+                char to_line[384];
+                ne_wan_oneframe(to_line, sizeof to_line, pkt, pkt_len);
                 flockfile(stderr);
-                (void)fprintf(stderr, "[ne-plain] xsk: %s | to_local: %s\n", wan_pre, post);
+                (void)fprintf(stderr, "[ne-plain] wan_to_local wan=%d q=%d len=%u %s\n", wan_idx,
+                             queue_idx, pkt_len, to_line);
                 (void)fflush(stderr);
                 funlockfile(stderr);
             }
