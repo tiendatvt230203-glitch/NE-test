@@ -12,6 +12,7 @@
 #include <netinet/ip.h>
 #include <netinet/tcp.h>
 #include <netinet/udp.h>
+#include <stdio.h>
 
 static volatile int running            = 1;
 static struct flow_table g_flow_table;
@@ -59,19 +60,11 @@ static int set_wan_l2_addrs(struct forwarder *fwd, int wan_idx, uint8_t *pkt) {
     return l2_rewrite_ether(pkt, w->dst_mac, w->src_mac);
 }
 
-/* WAN encapsulation:
- *   outer: dst/src MAC for WAN, EtherType=encap_ethertype
- *   payload: flow_id (8 bytes, big endian) + inner Ethernet frame (original)
- *
- * This keeps only L2 cleartext on the WAN link. On WAN RX we decap before
- * forwarding down to local so local/client never sees the custom EtherType.
- */
 #define NE_WAN_ENCAP_FID_LEN 4
 #define NE_WAN_ENCAP_LEN (sizeof(struct ether_header) + NE_WAN_ENCAP_FID_LEN)
 
 static uint64_t flow_id_from_5tuple(uint32_t src_ip, uint32_t dst_ip, uint16_t src_port,
                                    uint16_t dst_port, uint8_t protocol) {
-    /* Deterministic 64-bit mix; caller controls uniqueness by how it chooses inputs. */
     uint64_t x = ((uint64_t)src_ip << 32) ^ (uint64_t)dst_ip;
     x ^= ((uint64_t)src_port << 48) ^ ((uint64_t)dst_port << 32) ^ (uint64_t)protocol;
     x ^= x >> 33;
@@ -80,10 +73,6 @@ static uint64_t flow_id_from_5tuple(uint32_t src_ip, uint32_t dst_ip, uint16_t s
     x *= 0xc4ceb9fe1a85ec53ULL;
     x ^= x >> 33;
     return x;
-}
-
-static uint32_t bswap32_u32(uint32_t x) {
-    return htonl(x);
 }
 
 static int wan_encap_inplace(struct forwarder *fwd, int wan_idx, uint8_t *pkt, uint32_t *pkt_len_io) {
@@ -106,20 +95,17 @@ static int wan_encap_inplace(struct forwarder *fwd, int wan_idx, uint8_t *pkt, u
     if (parse_flow(pkt, pkt_len, &src_ip, &dst_ip, &src_port, &dst_port, &proto) == 0)
         fid = flow_id_from_5tuple(src_ip, dst_ip, src_port, dst_port, proto);
     else
-        fid = (uint64_t)pkt_len; /* fallback, keeps it deterministic but not flow-sticky */
+        fid = (uint64_t)pkt_len;
 
-    /* Shift inner frame right to make room for outer header+flow_id. */
     memmove(pkt + NE_WAN_ENCAP_LEN, pkt, pkt_len);
 
-    /* Outer Ethernet. */
     struct ether_header *eth = (struct ether_header *)pkt;
     memcpy(eth->ether_dhost, wan->dst_mac, MAC_LEN);
     memcpy(eth->ether_shost, wan->src_mac, MAC_LEN);
     eth->ether_type = htons(fwd->cfg->encap_ethertype);
 
-    /* flow_id (u32) in big-endian */
-    uint32_t fid32 = (uint32_t)(fid & 0xffffffffu);
-    uint32_t fid_be = bswap32_u32(fid32);
+    uint32_t fid32  = (uint32_t)(fid & 0xffffffffu);
+    uint32_t fid_be = htonl(fid32);
     memcpy(pkt + sizeof(*eth), &fid_be, sizeof(fid_be));
 
     *pkt_len_io = pkt_len + (uint32_t)NE_WAN_ENCAP_LEN;
@@ -140,10 +126,114 @@ static int wan_decap_inplace(struct forwarder *fwd, uint8_t *pkt, uint32_t *pkt_
     if (ntohs(eth->ether_type) != fwd->cfg->encap_ethertype)
         return 1;
 
-    /* Strip outer eth + flow_id, shift inner frame back. */
     memmove(pkt, pkt + NE_WAN_ENCAP_LEN, pkt_len - (uint32_t)NE_WAN_ENCAP_LEN);
     *pkt_len_io = pkt_len - (uint32_t)NE_WAN_ENCAP_LEN;
     return 0;
+}
+
+/* NE_PLAIN_DUMP_WAN_RX=1 [, NE_PLAIN_DUMP_WAN_RX_MAX=N] */
+static int ne_wan_rx_dump_take(void) {
+    if (getenv("NE_PLAIN_DUMP_WAN_RX") == NULL)
+        return 0;
+    static unsigned long max_n = 0;
+    static unsigned long seq    = 0;
+    if (max_n == 0) {
+        const char *m = getenv("NE_PLAIN_DUMP_WAN_RX_MAX");
+        max_n         = m ? strtoul(m, NULL, 10) : 50;
+        if (max_n == 0)
+            max_n = 50;
+    }
+    unsigned long n = __sync_fetch_and_add(&seq, 1);
+    return n < max_n;
+}
+
+static void ne_mac_fmt(char *buf, size_t buflen, const uint8_t *m) {
+    if (!buf || buflen < 18 || !m)
+        return;
+    snprintf(buf, buflen, "%02x:%02x:%02x:%02x:%02x:%02x", m[0], m[1], m[2], m[3], m[4], m[5]);
+}
+
+static void ne_dump_eth_ipv4_l4(FILE *o, const char *ind, const uint8_t *p, uint32_t plen) {
+    if (!p || plen < 14) {
+        fprintf(o, "%s<short L2 plen=%u>\n", ind, plen);
+        return;
+    }
+    char dmac[24], smac[24];
+    ne_mac_fmt(dmac, sizeof(dmac), p);
+    ne_mac_fmt(smac, sizeof(smac), p + 6);
+    uint16_t et = ((uint16_t)p[12] << 8) | p[13];
+    int      l3 = 14;
+    if (et == 0x8100 && plen >= 18) {
+        et = ((uint16_t)p[16] << 8) | p[17];
+        l3 = 18;
+        fprintf(o, "%sether %s > %s 802.1Q ethertype 0x%04x len=%u\n", ind, dmac, smac, et, plen);
+    } else {
+        fprintf(o, "%sether %s > %s ethertype 0x%04x len=%u\n", ind, dmac, smac, et, plen);
+    }
+    if (et != 0x0800 || plen < (uint32_t)(l3 + 20)) {
+        fprintf(o, "%s  (not IPv4)\n", ind);
+        return;
+    }
+    const struct iphdr *ip = (const struct iphdr *)(p + l3);
+    if (ip->ihl < 5)
+        return;
+    uint32_t ihl = (uint32_t)ip->ihl * 4u;
+    if (plen < (uint32_t)l3 + ihl)
+        return;
+    char sip[INET_ADDRSTRLEN], dip[INET_ADDRSTRLEN];
+    struct in_addr sa = { .s_addr = ip->saddr };
+    struct in_addr da = { .s_addr = ip->daddr };
+    inet_ntop(AF_INET, &sa, sip, sizeof(sip));
+    inet_ntop(AF_INET, &da, dip, sizeof(dip));
+    fprintf(o,
+            "%s  ipv4 %s > %s proto %u ttl %u tot_len %u id 0x%04x frag_off 0x%04x ihl %u\n", ind, sip,
+            dip, ip->protocol, ip->ttl, ntohs(ip->tot_len), ntohs(ip->id), ntohs(ip->frag_off),
+            (unsigned)ihl);
+    const uint8_t *l4    = p + l3 + ihl;
+    uint32_t       l4len = plen - (uint32_t)l3 - ihl;
+    if (ip->protocol == IPPROTO_TCP && l4len >= sizeof(struct tcphdr)) {
+        const struct tcphdr *tcp = (const struct tcphdr *)l4;
+        fprintf(o, "%s  tcp %u > %u seq %u ack %u win %u flags(raw) 0x%x\n", ind, ntohs(tcp->source),
+                ntohs(tcp->dest), ntohl(tcp->seq), ntohl(tcp->ack_seq), ntohs(tcp->window),
+                ((const uint8_t *)tcp)[13]);
+    } else if (ip->protocol == IPPROTO_UDP && l4len >= sizeof(struct udphdr)) {
+        const struct udphdr *udp = (const struct udphdr *)l4;
+        fprintf(o, "%s  udp %u > %u ulen %u\n", ind, ntohs(udp->source), ntohs(udp->dest),
+                ntohs(udp->len));
+    } else {
+        fprintf(o, "%s  l4 proto %u\n", ind, ip->protocol);
+    }
+}
+
+/* Debug: (1) Buffer y như sau xdp_wan_redirect -> XSK, chưa decap/MAC. KHÔNG bỏ. */
+static void ne_wan_dbg_after_xsk(int wan_idx, int q_idx, struct app_config *cfg, const uint8_t *pkt,
+                                 uint32_t len) {
+    fprintf(stderr, "\n[WAN-XSK] post-xdp_wan_redirect (chua decap) wan=%d q=%u len=%u\n", wan_idx,
+            (unsigned)q_idx, len);
+    if (!pkt || len < 14) {
+        fprintf(stderr, "  short\n");
+        return;
+    }
+    uint16_t et0 = ((uint16_t)pkt[12] << 8) | pkt[13];
+    if (cfg && cfg->encap_ethertype != 0 && et0 == cfg->encap_ethertype &&
+        len >= (uint32_t)NE_WAN_ENCAP_LEN + 14u) {
+        uint32_t fid_w;
+        memcpy(&fid_w, pkt + 14, 4);
+        fprintf(stderr, "  encap fid=0x%08x inner:\n", fid_w);
+        ne_dump_eth_ipv4_l4(stderr, "  ", pkt + NE_WAN_ENCAP_LEN, len - (uint32_t)NE_WAN_ENCAP_LEN);
+    } else {
+        ne_dump_eth_ipv4_l4(stderr, "  ", pkt, len);
+    }
+}
+
+/* Debug: (2) Đã decap + MAC cho local; in ngay trước send xuống iface. KHÔNG bỏ. */
+static void ne_wan_dbg_before_tx_local(const char *ifname, int tq, const uint8_t *pkt, uint32_t len) {
+    fprintf(stderr, "\n[TO-LOCAL] sau decap+MAC, truoc send %s q=%d len=%u\n", ifname, tq, len);
+    if (!pkt || len < 14) {
+        fprintf(stderr, "  short\n");
+        return;
+    }
+    ne_dump_eth_ipv4_l4(stderr, "  ", pkt, len);
 }
 
 static void sigint_handler(int sig) {
@@ -373,6 +463,10 @@ static void *wan_queue_thread_no_crypto(void *arg) {
             uint8_t *pkt     = (uint8_t *)pkt_ptrs[i];
             uint32_t pkt_len = pkt_lens[i];
 
+            int wan_dbg = ne_wan_rx_dump_take();
+            if (wan_dbg) /* (1) sau XSK, chua decap */
+                ne_wan_dbg_after_xsk(wan_idx, queue_idx, fwd->cfg, pkt, pkt_len);
+
             (void)wan_decap_inplace(fwd, pkt, &pkt_len);
 
             uint32_t dest_ip = get_dest_ip(pkt, pkt_len);
@@ -411,6 +505,9 @@ static void *wan_queue_thread_no_crypto(void *arg) {
                 __sync_fetch_and_add(&fwd->total_dropped, 1);
                 continue;
             }
+
+            if (wan_dbg) /* (2) sau decap+MAC, truoc send local */
+                ne_wan_dbg_before_tx_local(local_cfg->ifname, tq, pkt, pkt_len);
 
             if (interface_send_to_local_batch_queue(local_iface, tq, local_cfg, pkt, pkt_len) == 0) {
                 __sync_fetch_and_add(&fwd->wan_to_local, 1);
