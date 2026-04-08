@@ -71,7 +71,11 @@ struct app_config {
     int      cpu_local_base; /* legacy: base + queue_idx (per-iface) */
     int      cpu_wan_base;   /* legacy: base + queue_idx (per-iface) */
     int      cpu_lane_base;  /* global lane pinning: base + lane_id */
-    uint16_t encap_ethertype; /* if !=0, WAN frames are encapsulated with this EtherType for flow_id steering */
+    /* Encapsulation overhead (EtherType + flow_id) on WAN frames.
+     * Backward compatible: if encap_enable is not set in cfg, it defaults to (encap_ethertype != 0).
+     */
+    int      encap_enable;    /* 0: off, 1: on, -1: auto */
+    uint16_t encap_ethertype; /* EtherType used when encap_enable=1 */
 
     struct local_config locals[MAX_INTERFACES];
     int                 local_count;

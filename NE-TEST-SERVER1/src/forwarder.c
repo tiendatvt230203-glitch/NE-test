@@ -78,7 +78,7 @@ static uint64_t flow_id_from_5tuple(uint32_t src_ip, uint32_t dst_ip, uint16_t s
 static int wan_encap_inplace(struct forwarder *fwd, int wan_idx, uint8_t *pkt, uint32_t *pkt_len_io) {
     if (!fwd || !pkt || !pkt_len_io || wan_idx < 0 || wan_idx >= fwd->wan_count)
         return -1;
-    if (!fwd->cfg || fwd->cfg->encap_ethertype == 0)
+    if (!fwd->cfg || !fwd->cfg->encap_enable || fwd->cfg->encap_ethertype == 0)
         return -1;
 
     struct xsk_interface *wan = &fwd->wans[wan_idx];
@@ -140,7 +140,7 @@ static int wan_ne_encap_strip(const uint8_t *pkt, uint32_t len, uint16_t encap_e
 static int wan_decap_inplace(struct forwarder *fwd, uint8_t *pkt, uint32_t *pkt_len_w) {
     if (!fwd || !pkt || !pkt_len_w || !fwd->cfg)
         return -1;
-    if (fwd->cfg->encap_ethertype == 0)
+    if (!fwd->cfg->encap_enable || fwd->cfg->encap_ethertype == 0)
         return 1;
 
     uint32_t n = *pkt_len_w;
@@ -296,7 +296,7 @@ static void *local_queue_thread_no_crypto(void *arg) {
             uint8_t              *pkt = (uint8_t *)pkt_ptrs[i];
             uint32_t              out_len = pkt_lens[i];
 
-            if (fwd->cfg && fwd->cfg->encap_ethertype != 0) {
+            if (fwd->cfg && fwd->cfg->encap_enable && fwd->cfg->encap_ethertype != 0) {
                 if (wan_encap_inplace(fwd, wan_idx, pkt, &out_len) != 0) {
                     __sync_fetch_and_add(&fwd->total_dropped, 1);
                     continue;

@@ -56,6 +56,7 @@ int config_load_file(const char *path, struct app_config *cfg) {
     cfg->cpu_local_base = NE_PLAIN_CPU;
     cfg->cpu_wan_base   = NE_PLAIN_CPU;
     cfg->cpu_lane_base  = -1;
+    cfg->encap_enable   = -1;
     cfg->encap_ethertype = 0;
     snprintf(cfg->bpf_local_o, sizeof(cfg->bpf_local_o), "bpf/xdp_redirect.o");
     snprintf(cfg->bpf_wan_o, sizeof(cfg->bpf_wan_o), "bpf/xdp_wan_redirect.o");
@@ -98,6 +99,8 @@ int config_load_file(const char *path, struct app_config *cfg) {
             cfg->cpu_wan_base = (int)strtol(val, NULL, 10);
         else if (strcmp(key, "cpu_lane_base") == 0)
             cfg->cpu_lane_base = (int)strtol(val, NULL, 10);
+        else if (strcmp(key, "encap_enable") == 0)
+            cfg->encap_enable = ((int)strtol(val, NULL, 10) != 0) ? 1 : 0;
         else if (strcmp(key, "encap_ethertype") == 0)
             cfg->encap_ethertype = (uint16_t)strtoul(val, NULL, 0);
         else if (strcmp(key, "flow_ethertype") == 0)
@@ -168,6 +171,9 @@ int config_load_file(const char *path, struct app_config *cfg) {
     cfg->local_count = (max_local >= 0) ? (max_local + 1) : 0;
     cfg->wan_count   = (max_wan >= 0) ? (max_wan + 1) : 0;
 
+    if (cfg->encap_enable < 0)
+        cfg->encap_enable = (cfg->encap_ethertype != 0) ? 1 : 0;
+
     for (int i = 0; i < cfg->local_count; i++) {
         struct local_config *L = &cfg->locals[i];
         if (L->frame_size == 0)
@@ -180,7 +186,7 @@ int config_load_file(const char *path, struct app_config *cfg) {
             L->ring_size = DEFAULT_RING_SIZE;
         if (L->queue_count <= 0)
             L->queue_count = DEFAULT_QUEUE_COUNT;
-        L->encap_ethertype = cfg->encap_ethertype;
+        L->encap_ethertype = cfg->encap_enable ? cfg->encap_ethertype : 0;
         if (L->irq_cpu == -2)
             L->irq_cpu = cfg->cpu_policy.enabled ? cfg->cpu_policy.default_irq_cpu : -1;
     }
@@ -198,7 +204,7 @@ int config_load_file(const char *path, struct app_config *cfg) {
             W->window_size = 131072u * 1024u; /* default 131072 KiB = 128 MiB per WAN window */
         if (W->queue_count <= 0)
             W->queue_count = DEFAULT_QUEUE_COUNT;
-        W->encap_ethertype = cfg->encap_ethertype;
+        W->encap_ethertype = cfg->encap_enable ? cfg->encap_ethertype : 0;
         if (W->irq_cpu == -2)
             W->irq_cpu = cfg->cpu_policy.enabled ? cfg->cpu_policy.default_irq_cpu : -1;
     }
