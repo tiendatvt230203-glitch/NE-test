@@ -74,7 +74,8 @@ int xdp_wan_redirect_prog(struct xdp_md *ctx)
     __u16 proto = eth->h_proto;
     void *nh    = (void *)(eth + 1);
 
-    if (proto == __constant_htons(ETH_P_8021Q)) {
+    /* VLAN tag: handle both 802.1Q (0x8100) and 802.1ad/QinQ outer (0x88a8). */
+    if (proto == __constant_htons(ETH_P_8021Q) || proto == __constant_htons(ETH_P_8021AD)) {
         if ((__u8 *)nh + 4 > (__u8 *)data_end)
             return XDP_PASS;
         __be16 *ipe = (__be16 *)((__u8 *)nh + 2);
