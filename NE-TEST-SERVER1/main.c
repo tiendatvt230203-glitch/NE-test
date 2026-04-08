@@ -24,6 +24,7 @@ static int ne_plain_libbpf_print(enum libbpf_print_level level, const char *fmt,
 
 int main(int argc, char **argv) {
     libbpf_set_print(ne_plain_libbpf_print);
+    (void)setvbuf(stderr, NULL, _IONBF, 0);
 
     if (argc != 2) {
         fprintf(stderr, "usage: %s <config.cfg>\n", argv[0] ? argv[0] : "ne-plain");

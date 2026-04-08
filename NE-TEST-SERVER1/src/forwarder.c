@@ -456,6 +456,7 @@ static void *wan_queue_thread_no_crypto(void *arg) {
                     char post[384];
                     ne_wan_oneframe(post, sizeof post, pkt, pkt_len);
                     fprintf(stderr, "[ne-plain] xsk: %s | to_local: %s\n", wan_pre, post);
+                    (void)fflush(stderr);
                 }
             } else
                 __sync_fetch_and_add(&fwd->total_dropped, 1);
