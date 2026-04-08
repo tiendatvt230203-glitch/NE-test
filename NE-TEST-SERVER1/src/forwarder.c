@@ -114,26 +114,31 @@ static int wan_ne_encap_strip(const uint8_t *pkt, uint32_t len, uint16_t encap_e
                               uint32_t *fid_off_out, uint32_t *inner_off_out) {
     if (!pkt || encap_et == 0 || len < 14u)
         return -1;
-    uint16_t et = ((uint16_t)pkt[12] << 8) | pkt[13];
-    if (et == encap_et) {
-        uint32_t strip = (uint32_t)NE_WAN_ENCAP_LEN;
-        if (len < strip + 14u)
+    /* Handle: plain encap, VLAN 802.1Q (0x8100), QinQ/802.1ad (0x88a8), and up to 2 stacked tags. */
+    uint32_t off = 14u;
+    uint16_t et  = ((uint16_t)pkt[12] << 8) | pkt[13];
+
+    for (int tags = 0; tags < 2; tags++) {
+        if (et == encap_et) {
+            uint32_t strip = off + NE_WAN_ENCAP_FID_LEN;
+            if (len < strip + 14u)
+                return -1;
+            *strip_out     = strip;
+            *fid_off_out   = off;
+            *inner_off_out = strip;
+            return 0;
+        }
+
+        if (et != 0x8100u && et != 0x88a8u)
+            break;
+
+        if (len < off + 4u + 2u)
             return -1;
-        *strip_out     = strip;
-        *fid_off_out   = 14;
-        *inner_off_out = strip;
-        return 0;
+        /* VLAN tag: next EtherType sits at (off+2). */
+        et  = ((uint16_t)pkt[off + 2] << 8) | pkt[off + 3];
+        off += 4u;
     }
-    if (et == 0x8100u) {
-        if (len < 22u + 14u)
-            return -1;
-        if ((((uint16_t)pkt[16] << 8) | pkt[17]) != encap_et)
-            return -1;
-        *strip_out     = 22;
-        *fid_off_out   = 18;
-        *inner_off_out = 22;
-        return 0;
-    }
+
     return -1;
 }
 
